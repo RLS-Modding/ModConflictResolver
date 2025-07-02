@@ -1,10 +1,10 @@
 local M = {}
 
 -- Configuration
-local MERGE_OUTPUT_DIR = "/mods/unpacked/ModConflictResolutions/"
-local SUPPORTED_EXTENSIONS = {".json"}
-local DEBUG_LOGGING = true
-local RESOLVER_MOUNT_POINT = "/mods/unpacked/ModConflictResolutions/"
+local MERGE_OUTPUT_DIR = "/mods/ModConflictResolutions/"
+local SUPPORTED_EXTENSIONS = {".json", ".lua"}
+local DEBUG_LOGGING = false
+local RESOLVER_MOUNT_POINT = "/mods/ModConflictResolutions/"
 
 -- Active conflicts tracking
 local resolvedConflicts = {}
@@ -46,17 +46,11 @@ local function isSupportedFileType(filePath)
 end
 
 -- Get all active mods from the mod manager
-local function getActiveMods()
-    if not core_modmanager then
-        debugLog('W', 'ConflictResolver', 'Mod manager not available')
-        return {}
-    end
-    
+local function getActiveMods()    
     local activeMods = {}
     local allMods = core_modmanager.getMods()
     
     if not allMods then
-        debugLog('W', 'ConflictResolver', 'No mods found in mod manager')
         return {}
     end
     
@@ -66,7 +60,6 @@ local function getActiveMods()
         end
     end
     
-    debugLog('I', 'ConflictResolver', 'Found ' .. tostring(tableSize(activeMods)) .. ' active mods')
     return activeMods
 end
 
@@ -90,51 +83,41 @@ local function getModFiles(modData)
         return files
     end
     
-    debugLog('D', 'ConflictResolver', 'Scanning mod: ' .. modData.modname .. ' (type: ' .. (modData.modType or 'unknown') .. ')')
-    
     -- Handle repository mods with hashes
     if modData.modData and modData.modData.hashes then
-        debugLog('D', 'ConflictResolver', 'Repository mod with ' .. #modData.modData.hashes .. ' files in manifest')
         for _, hashData in ipairs(modData.modData.hashes) do
             local filePath = normalizePath(hashData[1])
             if isSupportedFileType(filePath) then
                 table.insert(files, filePath)
-                debugLog('D', 'ConflictResolver', 'Found in manifest: ' .. filePath)
             end
         end
     -- Handle unpacked mods
     elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
-        debugLog('D', 'ConflictResolver', 'Unpacked mod at: ' .. modData.unpackedPath)
         local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
         for _, fullPath in ipairs(modFiles) do
             local relativePath = fullPath:gsub(modData.unpackedPath, "")
             relativePath = normalizePath(relativePath)
             if isSupportedFileType(relativePath) then
                 table.insert(files, relativePath)
-                debugLog('D', 'ConflictResolver', 'Found unpacked: ' .. relativePath)
             end
         end
     -- Handle packed zip mods
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
-        debugLog('D', 'ConflictResolver', 'Packed mod ZIP: ' .. modData.fullpath)
         local zip = ZipArchive()
         if zip:openArchiveName(modData.fullpath, "R") then
             local filesInZip = zip:getFileList()
-            debugLog('D', 'ConflictResolver', 'ZIP contains ' .. #filesInZip .. ' files')
             for _, filePath in ipairs(filesInZip) do
                 filePath = normalizePath(filePath)
                 if isSupportedFileType(filePath) then
                     table.insert(files, filePath)
-                    debugLog('D', 'ConflictResolver', 'Found in ZIP: ' .. filePath)
                 end
             end
             zip:close()
         else
-            debugLog('E', 'ConflictResolver', 'Failed to open zip: ' .. tostring(modData.fullpath))
+            log('E', 'ConflictResolver', 'Failed to open zip: ' .. tostring(modData.fullpath))
         end
     end
     
-    debugLog('D', 'ConflictResolver', 'Mod ' .. modData.modname .. ' contains ' .. #files .. ' supported files')
     return files
 end
 
@@ -183,9 +166,6 @@ local function findFileConflicts()
                     modName = modName,
                     modData = modData
                 })
-                debugLog('D', 'ConflictResolver', 'Validated file exists: ' .. filePath .. ' in ' .. modName)
-            else
-                debugLog('D', 'ConflictResolver', 'File listed but not found: ' .. filePath .. ' in ' .. modName .. ' (skipping)')
             end
         end
     end
@@ -194,19 +174,14 @@ local function findFileConflicts()
     for filePath, modsList in pairs(fileToMods) do
         if #modsList > 1 then
             conflicts[filePath] = modsList
-            local modNames = {}
-            for _, modInfo in ipairs(modsList) do
-                table.insert(modNames, modInfo.modName)
-            end
-            debugLog('I', 'ConflictResolver', 'Conflict found: ' .. filePath .. ' in ' .. #modsList .. ' mods (' .. table.concat(modNames, ', ') .. ')')
         end
     end
     
     return conflicts
 end
 
--- Read JSON file directly from a specific mod's source (bypassing virtual file system)
-local function readJsonFromMod(filePath, modData)
+-- Read file directly from a specific mod's source (bypassing virtual file system)
+local function readFileFromMod(filePath, modData)
     filePath = normalizePath(filePath)
     local content = nil
     
@@ -215,9 +190,6 @@ local function readJsonFromMod(filePath, modData)
         local fullPath = modData.unpackedPath .. filePath
         if FS:fileExists(fullPath) then
             content = readFile(fullPath)
-            debugLog('D', 'ConflictResolver', 'Read from unpacked: ' .. fullPath)
-        else
-            debugLog('D', 'ConflictResolver', 'File not found in unpacked mod: ' .. fullPath)
         end
     -- Handle packed ZIP mods - read directly from ZIP file
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
@@ -228,37 +200,19 @@ local function readJsonFromMod(filePath, modData)
             
             -- Try to find the file in the ZIP
             local filesInZip = zip:getFileList()
-            local found = false
             for idx, zipFile in ipairs(filesInZip) do
                 if zipFile == zipEntryPath or zipFile == filePath then
                     content = zip:readFileEntryByIdx(idx)
-                    debugLog('D', 'ConflictResolver', 'Read from ZIP: ' .. modData.fullpath .. ' -> ' .. zipFile .. ' (index: ' .. idx .. ')')
-                    found = true
                     break
                 end
             end
-            if not found then
-                debugLog('D', 'ConflictResolver', 'File not found in ZIP: ' .. zipEntryPath .. ' (looked for: ' .. filePath .. ')')
-            end
             zip:close()
         else
-            debugLog('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
+            log('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
         end
     end
     
-    if not content then
-        debugLog('W', 'ConflictResolver', 'Could not read ' .. filePath .. ' from mod ' .. modData.modname)
-        return nil
-    end
-    
-    local success, jsonData = pcall(jsonDecode, content)
-    if not success then
-        debugLog('E', 'ConflictResolver', 'Failed to parse JSON in ' .. filePath .. ' from mod ' .. modData.modname .. ': ' .. tostring(jsonData))
-        return nil
-    end
-    
-    debugLog('D', 'ConflictResolver', 'Successfully parsed JSON from ' .. modData.modname .. ': ' .. filePath)
-    return jsonData
+    return content
 end
 
 -- Check if a table is an array (has consecutive integer keys starting from 1)
@@ -311,18 +265,16 @@ local function mountConflictResolver()
     if FS:directoryExists(RESOLVER_MOUNT_POINT) then
         if not FS:isMounted(RESOLVER_MOUNT_POINT) then
             if FS:mount(RESOLVER_MOUNT_POINT) then
-                debugLog('I', 'ConflictResolver', 'Successfully mounted conflict resolver: ' .. RESOLVER_MOUNT_POINT)
+                log('I', 'ConflictResolver', 'Mounted conflict resolver')
                 return true
             else
-                debugLog('E', 'ConflictResolver', 'Failed to mount conflict resolver: ' .. RESOLVER_MOUNT_POINT)
+                log('E', 'ConflictResolver', 'Failed to mount conflict resolver')
                 return false
             end
         else
-            debugLog('D', 'ConflictResolver', 'Conflict resolver already mounted: ' .. RESOLVER_MOUNT_POINT)
             return true
         end
     else
-        debugLog('D', 'ConflictResolver', 'Conflict resolver directory does not exist yet: ' .. RESOLVER_MOUNT_POINT)
         return false
     end
 end
@@ -331,14 +283,185 @@ end
 local function unmountConflictResolver()
     if FS:isMounted(RESOLVER_MOUNT_POINT) then
         if FS:unmount(RESOLVER_MOUNT_POINT) then
-            debugLog('I', 'ConflictResolver', 'Successfully unmounted conflict resolver: ' .. RESOLVER_MOUNT_POINT)
+            log('I', 'ConflictResolver', 'Unmounted conflict resolver')
             return true
         else
-            debugLog('E', 'ConflictResolver', 'Failed to unmount conflict resolver: ' .. RESOLVER_MOUNT_POINT)
+            log('E', 'ConflictResolver', 'Failed to unmount conflict resolver')
             return false
         end
     end
     return true
+end
+
+-- Parse Lua file to extract structure
+local function parseLuaFile(content)
+    local structure = {
+        header = "",
+        functions = {},
+        variables = {},
+        exports = {},
+        footer = ""
+    }
+    
+    local lines = {}
+    for line in content:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+    end
+    
+    local inFunction = nil
+    local functionContent = {}
+    local i = 1
+    
+    while i <= #lines do
+        local line = lines[i]
+        local trimmedLine = line:match("^%s*(.-)%s*$")
+        
+        -- Skip empty lines and comments at the top (header)
+        if not inFunction and (trimmedLine == "" or trimmedLine:startswith("--") or trimmedLine:startswith("local M = {}")) then
+            if structure.header == "" then
+                structure.header = line
+            else
+                structure.header = structure.header .. "\n" .. line
+            end
+        -- Function definition
+        elseif trimmedLine:match("^local function (%w+)%(") then
+            local funcName = trimmedLine:match("^local function (%w+)%(")
+            inFunction = funcName
+            functionContent = {line}
+        -- End of function
+        elseif inFunction and trimmedLine:match("^end%s*$") then
+            table.insert(functionContent, line)
+            structure.functions[inFunction] = table.concat(functionContent, "\n")
+            inFunction = nil
+            functionContent = {}
+        -- Inside function
+        elseif inFunction then
+            table.insert(functionContent, line)
+        -- Module exports
+        elseif trimmedLine:match("^M%.(%w+)%s*=") then
+            local exportName = trimmedLine:match("^M%.(%w+)%s*=")
+            local exportValue = trimmedLine:match("^M%.%w+%s*=%s*(.+)$")
+            structure.exports[exportName] = exportValue
+        -- Return statement or other footer content
+        elseif trimmedLine:match("^return") or (trimmedLine ~= "" and not trimmedLine:startswith("--")) then
+            if structure.footer == "" then
+                structure.footer = line
+            else
+                structure.footer = structure.footer .. "\n" .. line
+            end
+        end
+        
+        i = i + 1
+    end
+    
+    return structure
+end
+
+-- Merge function content by combining variable assignments
+local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, functionName)
+    if not baseFuncContent then return overlayFuncContent end
+    if not overlayFuncContent then return baseFuncContent end
+    
+    -- For onReset and updateGFX, we want to merge the content
+    if functionName == "onReset" or functionName == "updateGFX" then
+        local baseLines = {}
+        local overlayLines = {}
+        
+        for line in baseFuncContent:gmatch("[^\r\n]+") do
+            local trimmed = line:match("^%s*(.-)%s*$")
+            if not (trimmed:startswith("local function") or trimmed == "end" or trimmed == "" or trimmed:startswith("--")) then
+                table.insert(baseLines, line)
+            end
+        end
+        
+        for line in overlayFuncContent:gmatch("[^\r\n]+") do
+            local trimmed = line:match("^%s*(.-)%s*$") 
+            if not (trimmed:startswith("local function") or trimmed == "end" or trimmed == "" or trimmed:startswith("--")) then
+                -- Check if this variable assignment already exists in base
+                local varName = trimmed:match("electrics%.values%[['\"](.-)['\"]%]")
+                if varName then
+                    local found = false
+                    for _, baseLine in ipairs(baseLines) do
+                        if baseLine:match("electrics%.values%[['\"]*" .. varName .. "['\"]%]") then
+                            found = true
+                            break
+                        end
+                    end
+                    if not found then
+                        table.insert(baseLines, line)
+                    end
+                else
+                    table.insert(baseLines, line)
+                end
+            end
+        end
+        
+        -- Reconstruct function
+        local funcHeader = baseFuncContent:match("(local function .-%(.-%))")
+        local result = funcHeader .. "\n"
+        for _, line in ipairs(baseLines) do
+            result = result .. line .. "\n"
+        end
+        result = result .. "end"
+        
+        return result
+    else
+        -- For other functions, prefer the base version
+        return baseFuncContent
+    end
+end
+
+-- Merge two Lua file structures
+local function mergeLua(baseStructure, overlayStructure)
+    local merged = {
+        header = baseStructure.header,
+        functions = {},
+        variables = {},
+        exports = {},
+        footer = baseStructure.footer
+    }
+    
+    -- Merge functions
+    for funcName, funcContent in pairs(baseStructure.functions) do
+        merged.functions[funcName] = funcContent
+    end
+    for funcName, funcContent in pairs(overlayStructure.functions) do
+        if merged.functions[funcName] then
+            merged.functions[funcName] = mergeLuaFunctionContent(merged.functions[funcName], funcContent, funcName)
+        else
+            merged.functions[funcName] = funcContent
+        end
+    end
+    
+    -- Merge exports (combine all exports)
+    for exportName, exportValue in pairs(baseStructure.exports) do
+        merged.exports[exportName] = exportValue
+    end
+    for exportName, exportValue in pairs(overlayStructure.exports) do
+        merged.exports[exportName] = exportValue
+    end
+    
+    return merged
+end
+
+-- Generate Lua file content from structure
+local function generateLuaContent(structure)
+    local content = structure.header .. "\n\n"
+    
+    -- Add functions
+    for funcName, funcContent in pairs(structure.functions) do
+        content = content .. funcContent .. "\n\n"
+    end
+    
+    -- Add exports section
+    content = content .. "-- public interface\n"
+    for exportName, exportValue in pairs(structure.exports) do
+        content = content .. "M." .. exportName .. " = " .. exportValue .. "\n"
+    end
+    
+    content = content .. "\n" .. (structure.footer or "return M")
+    
+    return content
 end
 
 -- Deep merge two JSON objects
@@ -369,47 +492,61 @@ local function mergeJson(base, overlay)
     return result
 end
 
--- Merge conflicting JSON files
+-- Merge conflicting files (JSON or Lua)
 local function mergeConflictingFiles(filePath, modsList)
-    debugLog('I', 'ConflictResolver', 'Merging ' .. #modsList .. ' versions of ' .. filePath)
-    
-    local mergedJson = nil
+    local isLuaFile = filePath:lower():endswith('.lua')
+    local mergedData = nil
     local sourceMods = {}
     
     -- Read and merge all versions
     for _, modInfo in ipairs(modsList) do
-        debugLog('D', 'ConflictResolver', 'Reading ' .. filePath .. ' from mod: ' .. modInfo.modName)
-        local jsonData = readJsonFromMod(filePath, modInfo.modData)
-        if jsonData then
+        local fileContent = readFileFromMod(filePath, modInfo.modData)
+        if fileContent then
             table.insert(sourceMods, modInfo.modName)
-            debugLog('I', 'ConflictResolver', 'Successfully read ' .. filePath .. ' from ' .. modInfo.modName .. ' (' .. #(jsonData.bindings or {}) .. ' bindings)')
-            if mergedJson == nil then
-                mergedJson = jsonData
+            
+            if isLuaFile then
+                -- Parse Lua file
+                local luaStructure = parseLuaFile(fileContent)
+                if mergedData == nil then
+                    mergedData = luaStructure
+                else
+                    mergedData = mergeLua(mergedData, luaStructure)
+                end
             else
-                mergedJson = mergeJson(mergedJson, jsonData)
+                -- Parse JSON file
+                local success, jsonData = pcall(jsonDecode, fileContent)
+                if success then
+                    if mergedData == nil then
+                        mergedData = jsonData
+                    else
+                        mergedData = mergeJson(mergedData, jsonData)
+                    end
+                else
+                    log('E', 'ConflictResolver', 'Failed to parse JSON in ' .. filePath .. ' from mod ' .. modInfo.modName)
+                end
             end
-        else
-            debugLog('W', 'ConflictResolver', 'Failed to read ' .. filePath .. ' from ' .. modInfo.modName)
         end
     end
     
-    if mergedJson == nil then
-        debugLog('E', 'ConflictResolver', 'No valid JSON data found for ' .. filePath)
+    if mergedData == nil then
+        log('E', 'ConflictResolver', 'No valid data found for ' .. filePath)
         return false
     end
     
     -- Ensure output directory exists
     local outputPath = MERGE_OUTPUT_DIR .. filePath
     local outputDir = outputPath:match("(.+)/[^/]+$")
-    if outputDir and not FS:directoryExists(outputDir) then
-        -- Create directory structure (BeamNG should handle this automatically when writing files)
-        debugLog('D', 'ConflictResolver', 'Output directory will be created: ' .. outputDir)
-    end
     
     -- Write merged file
-    local success = jsonWriteFile(outputPath, mergedJson, true)
+    local success = false
+    if isLuaFile then
+        local luaContent = generateLuaContent(mergedData)
+        success = writeFile(outputPath, luaContent)
+    else
+        success = jsonWriteFile(outputPath, mergedData, true)
+    end
+    
     if success then
-        debugLog('I', 'ConflictResolver', 'Successfully merged ' .. filePath .. ' to ' .. outputPath)
         resolvedConflicts[filePath] = {
             outputPath = outputPath,
             sourceMods = sourceMods,
@@ -417,7 +554,7 @@ local function mergeConflictingFiles(filePath, modsList)
         }
         return true
     else
-        debugLog('E', 'ConflictResolver', 'Failed to write merged file: ' .. outputPath)
+        log('E', 'ConflictResolver', 'Failed to write merged file: ' .. outputPath)
         return false
     end
 end
@@ -427,7 +564,6 @@ local function resolveConflicts(forceRun)
     -- Debounce multiple rapid calls unless forced
     local currentTime = os.time()
     if not forceRun and (currentTime - lastResolutionTime) < RESOLUTION_DEBOUNCE_TIME then
-        debugLog('D', 'ConflictResolver', 'Skipping conflict resolution due to debounce (last run ' .. (currentTime - lastResolutionTime) .. 's ago)')
         return {
             success = false,
             message = "Skipped due to debounce",
@@ -437,14 +573,12 @@ local function resolveConflicts(forceRun)
     end
     
     lastResolutionTime = currentTime
-    debugLog('I', 'ConflictResolver', 'Starting conflict resolution...')
     
     local conflicts = findFileConflicts()
     local resolvedCount = 0
     local totalConflicts = tableSize(conflicts)
     
     if totalConflicts == 0 then
-        debugLog('I', 'ConflictResolver', 'No conflicts found')
         return {
             success = true,
             message = "No conflicts found",
@@ -452,8 +586,6 @@ local function resolveConflicts(forceRun)
             totalConflicts = 0
         }
     end
-    
-    debugLog('I', 'ConflictResolver', 'Found ' .. totalConflicts .. ' file conflicts')
     
     -- Resolve each conflict
     for filePath, modsList in pairs(conflicts) do
@@ -471,12 +603,11 @@ local function resolveConflicts(forceRun)
     }
     
     local message = string.format("Resolved %d/%d conflicts", resolvedCount, totalConflicts)
-    debugLog('I', 'ConflictResolver', message)
+    log('I', 'ConflictResolver', message)
     
     -- Mount the conflict resolver to make merged files active
     if resolvedCount > 0 then
         if mountConflictResolver() then
-            debugLog('I', 'ConflictResolver', 'Conflict resolver mounted - merged files are now active')
             -- Notify file system of changes
             local changedFiles = {}
             for filePath, conflictInfo in pairs(resolvedConflicts) do
@@ -485,8 +616,6 @@ local function resolveConflicts(forceRun)
             if #changedFiles > 0 then
                 _G.onFileChanged(changedFiles)
             end
-        else
-            debugLog('W', 'ConflictResolver', 'Failed to mount conflict resolver - merged files may not be active')
         end
         
         extensions.hook('onModConflictsResolved', {
@@ -525,15 +654,11 @@ local function clearResolvedConflicts()
     -- Remove the resolver directory if it exists
     if FS:directoryExists(RESOLVER_MOUNT_POINT) then
         FS:remove(RESOLVER_MOUNT_POINT)
-        debugLog('I', 'ConflictResolver', 'Removed conflict resolver directory: ' .. RESOLVER_MOUNT_POINT)
     end
-    
-    debugLog('I', 'ConflictResolver', 'Cleared resolved conflicts cache and unmounted resolver')
 end
 
 -- Hook into mod activation/deactivation to auto-resolve conflicts
 local function onModActivated(modData)
-    debugLog('D', 'ConflictResolver', 'Mod activated: ' .. (modData.modname or 'unknown'))
     -- Delay resolution to allow mod to fully mount
     if core_jobsystem then
         core_jobsystem.create(function(job)
@@ -547,7 +672,6 @@ local function onModActivated(modData)
 end
 
 local function onModDeactivated(modData)
-    debugLog('D', 'ConflictResolver', 'Mod deactivated: ' .. (modData.modname or 'unknown'))
     -- Re-resolve conflicts when mods are deactivated
     if core_jobsystem then
         core_jobsystem.create(function(job)
@@ -561,8 +685,6 @@ end
 
 -- Initialize the conflict resolver
 local function onExtensionLoaded()
-    debugLog('I', 'ConflictResolver', 'ModConflictResolver loaded')
-    
     -- Initial conflict resolution
     if core_jobsystem then
         core_jobsystem.create(function(job)
@@ -572,50 +694,6 @@ local function onExtensionLoaded()
     else
         resolveConflicts()
     end
-end
-
--- Console commands for manual control
-local function onConsoleCmd(cmdName, ...)
-    if cmdName == "modconflict_resolve" then
-        local result = resolveConflicts(true) -- Force resolution
-        print("Conflict Resolution Result:")
-        print("- Resolved: " .. result.resolvedCount .. "/" .. result.totalConflicts)
-        print("- Message: " .. result.message)
-        return true
-    elseif cmdName == "modconflict_status" then
-        local status = getConflictStatus()
-        print("ModConflictResolver Status:")
-        print("- Resolved conflicts: " .. tableSize(status.resolvedConflicts))
-        print("- Last run conflicts: " .. (status.conflictCounts.total or 0))
-        print("- Last run resolved: " .. (status.conflictCounts.resolved or 0))
-        if status.conflictCounts.lastRun then
-            print("- Last run: " .. os.date("%c", status.conflictCounts.lastRun))
-        end
-        return true
-    elseif cmdName == "modconflict_clear" then
-        clearResolvedConflicts()
-        print("Cleared resolved conflicts cache")
-        return true
-    elseif cmdName == "modconflict_debug" then
-        DEBUG_LOGGING = not DEBUG_LOGGING
-        print("Debug logging " .. (DEBUG_LOGGING and "enabled" or "disabled"))
-        return true
-    elseif cmdName == "modconflict_mount" then
-        if mountConflictResolver() then
-            print("Conflict resolver mounted successfully")
-        else
-            print("Failed to mount conflict resolver")
-        end
-        return true
-    elseif cmdName == "modconflict_unmount" then
-        if unmountConflictResolver() then
-            print("Conflict resolver unmounted successfully")
-        else
-            print("Failed to unmount conflict resolver")
-        end
-        return true
-    end
-    return false
 end
 
 -- Public API
@@ -629,6 +707,5 @@ M.unmountConflictResolver = unmountConflictResolver
 M.onExtensionLoaded = onExtensionLoaded
 M.onModActivated = onModActivated
 M.onModDeactivated = onModDeactivated
-M.onConsoleCmd = onConsoleCmd
 
 return M

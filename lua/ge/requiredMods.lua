@@ -144,6 +144,10 @@ end
 
 -- Identify our parent mod when a non-dependency mod activates
 local function onModActivated(modData)
+    if ourParentMod then
+        return
+    end
+
     if not modData or not modData.modname then
         return
     end
