@@ -1,6 +1,8 @@
 local M = {}
 
--- Configuration
+--[[
+    Configuration
+--]]
 local MERGE_OUTPUT_DIR = "/mods/ModConflictResolutions/"
 local SUPPORTED_EXTENSIONS = {".json", ".lua"}
 local DEBUG_LOGGING = false
@@ -11,6 +13,9 @@ local conflictCounts = {}
 local lastResolutionTime = 0
 local RESOLUTION_DEBOUNCE_TIME = 2.0
 
+--[[
+    Cache Management
+--]]
 local modFileCache = {}
 local zipFileListCache = {}
 local fileContentCache = {}
@@ -23,7 +28,6 @@ local function debugLog(level, tag, message)
     end
 end
 
--- Cache management
 local function isCacheValid(modName)
     local cacheTime = modCacheValidTime[modName]
     if not cacheTime then return false end
@@ -37,7 +41,6 @@ end
 local function clearModCache(modName)
     modFileCache[modName] = nil
     modCacheValidTime[modName] = nil
-    -- Clear related file content cache entries
     for cacheKey in pairs(fileContentCache) do
         if cacheKey:startswith(modName .. ":") then
             fileContentCache[cacheKey] = nil
@@ -52,12 +55,42 @@ local function clearAllCaches()
     modCacheValidTime = {}
 end
 
-local function tableSizeHelper(t)
+local function tableSize(t)
+    if _G.tableSize then
+        return _G.tableSize(t)
+    end
     local count = 0
-    for _ in pairs(t) do count = count + 1 end
+    for _ in pairs(t) do
+        count = count + 1
+    end
     return count
 end
 
+local function getZipFileMap(zipPath)
+    if zipFileListCache[zipPath] then
+        return zipFileListCache[zipPath]
+    end
+
+    debugLog('D', 'ConflictResolver', 'Loading ZIP file list for: ' .. zipPath)
+    local zip = ZipArchive()
+    if zip:openArchiveName(zipPath, "R") then
+        local fileList = zip:getFileList()
+        local fileMap = {}
+        for i, f in ipairs(fileList) do
+            fileMap[f] = i
+        end
+        zipFileListCache[zipPath] = fileMap
+        zip:close()
+    else
+        log('E', 'ConflictResolver', 'Failed to open zip: ' .. tostring(zipPath))
+        zipFileListCache[zipPath] = {}
+    end
+    return zipFileListCache[zipPath]
+end
+
+--[[
+    Core Logic
+--]]
 local function deepcopy(orig)
     local orig_type = type(orig)
     local copy
@@ -101,7 +134,6 @@ end
 
 local function normalizePath(path)
     if not path then return "" end
-    -- Convert backslashes and remove double slashes
     path = path:gsub("\\", "/")
     path = path:gsub("//+", "/")
     if not path:startswith("/") then
@@ -110,49 +142,44 @@ local function normalizePath(path)
     return path
 end
 
--- Batch read multiple files from ZIP to reduce I/O operations
 local function batchReadFromZip(zipPath, filePaths)
     local results = {}
+    local zipFileMap = getZipFileMap(zipPath)
+    if tableSize(zipFileMap) == 0 then
+        return results
+    end
+
     local zip = ZipArchive()
-    
     if not zip:openArchiveName(zipPath, "R") then
         log('E', 'ConflictResolver', 'Failed to open ZIP for batch read: ' .. zipPath)
         return results
     end
-    
-    -- Get or use cached file list
-    local filesInZip = zipFileListCache[zipPath]
-    if not filesInZip then
-        filesInZip = zip:getFileList()
-        zipFileListCache[zipPath] = filesInZip
-    end
-    
-    -- Read all requested files
+
     for _, filePath in ipairs(filePaths) do
         local normalizedPath = normalizePath(filePath)
         local zipEntryPath = normalizedPath:startswith("/") and normalizedPath:sub(2) or normalizedPath
         
-        for idx, zipFile in ipairs(filesInZip) do
-            if zipFile == zipEntryPath or zipFile == normalizedPath then
-                local content = zip:readFileEntryByIdx(idx)
-                if content then
-                    results[normalizedPath] = content
-                end
-                break
+        local fileIndex = zipFileMap[zipEntryPath] or zipFileMap[normalizedPath]
+        if fileIndex then
+            local content = zip:readFileEntryByIdx(fileIndex)
+            if content then
+                results[normalizedPath] = content
             end
         end
     end
-    
+
     zip:close()
     return results
 end
 
+--[[
+    File Merging Strategies
+--]]
 local function getModFiles(modData, modName)
     if not modData then
         return {}
     end
     
-    -- Check cache first
     if modName and isCacheValid(modName) and modFileCache[modName] then
         debugLog('D', 'ConflictResolver', 'Cache hit for mod files: ' .. modName)
         return modFileCache[modName]
@@ -160,7 +187,6 @@ local function getModFiles(modData, modName)
     
     local files = {}
     
-    -- Handle repository mods with hashes
     if modData.modData and modData.modData.hashes then
         for _, hashData in ipairs(modData.modData.hashes) do
             local filePath = normalizePath(hashData[1])
@@ -168,7 +194,6 @@ local function getModFiles(modData, modName)
                 table.insert(files, filePath)
             end
         end
-    -- Handle unpacked mods
     elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
         local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
         for _, fullPath in ipairs(modFiles) do
@@ -178,32 +203,18 @@ local function getModFiles(modData, modName)
                 table.insert(files, relativePath)
             end
         end
-    -- Handle packed ZIP mods
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
         local zipPath = modData.fullpath
-        if not zipFileListCache[zipPath] then
-            debugLog('D', 'ConflictResolver', 'Loading ZIP file list for: ' .. zipPath)
-            local zip = ZipArchive()
-            if zip:openArchiveName(zipPath, "R") then
-                zipFileListCache[zipPath] = zip:getFileList()
-                zip:close()
-            else
-                log('E', 'ConflictResolver', 'Failed to open zip: ' .. tostring(zipPath))
-                zipFileListCache[zipPath] = {}
-            end
-        else
-            debugLog('D', 'ConflictResolver', 'Using cached ZIP file list for: ' .. zipPath)
-        end
-        
-        for _, filePath in ipairs(zipFileListCache[zipPath]) do
-            filePath = normalizePath(filePath)
-            if isSupportedFileType(filePath) then
-                table.insert(files, filePath)
+        local zipFileMap = getZipFileMap(zipPath)
+
+        for filePath, _ in pairs(zipFileMap) do
+            local normalized = normalizePath(filePath)
+            if isSupportedFileType(normalized) then
+                table.insert(files, normalized)
             end
         end
     end
     
-    -- Cache the result
     if modName then
         modFileCache[modName] = files
         updateCacheTime(modName)
@@ -219,28 +230,18 @@ local function fileExistsInMod(filePath, modData)
         local fullPath = modData.unpackedPath .. filePath
         return FS:fileExists(fullPath)
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
-        local zip = ZipArchive()
-        if zip:openArchiveName(modData.fullpath, "R") then
-            local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
-            local filesInZip = zip:getFileList()
-            for _, zipFile in ipairs(filesInZip) do
-                if zipFile == zipEntryPath or zipFile == filePath then
-                    zip:close()
-                    return true
-                end
-            end
-            zip:close()
-        end
+        local zipFileMap = getZipFileMap(modData.fullpath)
+        local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
+        return zipFileMap[zipEntryPath] ~= nil or zipFileMap[filePath] ~= nil
     end
     return false
 end
 
 local function findFileConflicts()
     local activeMods = getActiveMods()
-    local fileToMods = {} -- Maps file paths to mods that contain them
+    local fileToMods = {}
     local conflicts = {}
     
-    -- Build file mapping with validation
     for modName, modData in pairs(activeMods) do
         local modFiles = getModFiles(modData, modName)
         for _, filePath in ipairs(modFiles) do
@@ -256,7 +257,6 @@ local function findFileConflicts()
         end
     end
     
-    -- Identify conflicts (files present in multiple mods)
     for filePath, modsList in pairs(fileToMods) do
         if #modsList > 1 then
             conflicts[filePath] = modsList
@@ -266,11 +266,9 @@ local function findFileConflicts()
     return conflicts
 end
 
--- Read file directly from mod source (bypassing VFS)
 local function readFileFromMod(filePath, modData, modName)
     filePath = normalizePath(filePath)
     
-    -- Check cache first
     local cacheKey = (modName or "unknown") .. ":" .. filePath
     if fileContentCache[cacheKey] then
         debugLog('D', 'ConflictResolver', 'Cache hit for file content: ' .. cacheKey)
@@ -285,25 +283,18 @@ local function readFileFromMod(filePath, modData, modName)
             content = readFile(fullPath)
         end
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
-        local zip = ZipArchive()
-        if zip:openArchiveName(modData.fullpath, "R") then
-            local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
-            
-            local filesInZip = zipFileListCache[modData.fullpath]
-            if not filesInZip then
-                filesInZip = zip:getFileList()
-                zipFileListCache[modData.fullpath] = filesInZip
+        local zipFileMap = getZipFileMap(modData.fullpath)
+        local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
+        local fileIndex = zipFileMap[zipEntryPath] or zipFileMap[filePath]
+
+        if fileIndex then
+            local zip = ZipArchive()
+            if zip:openArchiveName(modData.fullpath, "R") then
+                content = zip:readFileEntryByIdx(fileIndex)
+                zip:close()
+            else
+                log('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
             end
-            
-            for idx, zipFile in ipairs(filesInZip) do
-                if zipFile == zipEntryPath or zipFile == filePath then
-                    content = zip:readFileEntryByIdx(idx)
-                    break
-                end
-            end
-            zip:close()
-        else
-            log('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
         end
     end
     
@@ -314,7 +305,9 @@ local function readFileFromMod(filePath, modData, modName)
     return content
 end
 
--- Check if table is an array (consecutive integer keys from 1)
+--[[
+    Public API
+--]]
 local function isArray(t)
     if type(t) ~= "table" then return false end
     local count = 0
@@ -333,7 +326,6 @@ end
 local function mergeArrays(baseArray, overlayArray, arrayKey)
     local result = deepcopy(baseArray)
     
-    -- For input bindings, concatenate and deduplicate
     if arrayKey == "bindings" then
         for _, overlayItem in ipairs(overlayArray) do
             local isDuplicate = false
@@ -348,7 +340,6 @@ local function mergeArrays(baseArray, overlayArray, arrayKey)
             end
         end
     else
-        -- For other arrays, concatenate without deduplication
         for _, item in ipairs(overlayArray) do
             table.insert(result, item)
         end
@@ -388,7 +379,6 @@ local function unmountConflictResolver()
     return true
 end
 
--- Parse Lua file structure for merging
 local function parseLuaFile(content)
     local structure = {
         header = "",
@@ -411,33 +401,27 @@ local function parseLuaFile(content)
         local line = lines[i]
         local trimmedLine = line:match("^%s*(.-)%s*$")
         
-        -- Header (comments, empty lines, module declaration)
         if not inFunction and (trimmedLine == "" or trimmedLine:startswith("--") or trimmedLine:startswith("local M = {}")) then
             if structure.header == "" then
                 structure.header = line
             else
                 structure.header = structure.header .. "\n" .. line
             end
-        -- Function definition
         elseif trimmedLine:match("^local function (%w+)%(") then
             local funcName = trimmedLine:match("^local function (%w+)%(")
             inFunction = funcName
             functionContent = {line}
-        -- End of function
         elseif inFunction and trimmedLine:match("^end%s*$") then
             table.insert(functionContent, line)
             structure.functions[inFunction] = table.concat(functionContent, "\n")
             inFunction = nil
             functionContent = {}
-        -- Inside function
         elseif inFunction then
             table.insert(functionContent, line)
-        -- Module exports
         elseif trimmedLine:match("^M%.(%w+)%s*=") then
             local exportName = trimmedLine:match("^M%.(%w+)%s*=")
             local exportValue = trimmedLine:match("^M%.%w+%s*=%s*(.+)$")
             structure.exports[exportName] = exportValue
-        -- Footer (return statement, etc.)
         elseif trimmedLine:match("^return") or (trimmedLine ~= "" and not trimmedLine:startswith("--")) then
             if structure.footer == "" then
                 structure.footer = line
@@ -456,7 +440,6 @@ local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, func
     if not baseFuncContent then return overlayFuncContent end
     if not overlayFuncContent then return baseFuncContent end
     
-    -- For onReset and updateGFX, merge the content
     if functionName == "onReset" or functionName == "updateGFX" then
         local baseLines = {}
         local overlayLines = {}
@@ -471,7 +454,6 @@ local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, func
         for line in overlayFuncContent:gmatch("[^\r\n]+") do
             local trimmed = line:match("^%s*(.-)%s*$") 
             if not (trimmed:startswith("local function") or trimmed == "end" or trimmed == "" or trimmed:startswith("--")) then
-                -- Check if this variable assignment already exists
                 local varName = trimmed:match("electrics%.values%[['\"](.-)['\"]%]")
                 if varName then
                     local found = false
@@ -490,7 +472,6 @@ local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, func
             end
         end
         
-        -- Reconstruct function
         local funcHeader = baseFuncContent:match("(local function .-%(.-%))")
         local result = funcHeader .. "\n"
         for _, line in ipairs(baseLines) do
@@ -500,7 +481,6 @@ local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, func
         
         return result
     else
-        -- For other functions, prefer base version
         return baseFuncContent
     end
 end
@@ -514,7 +494,6 @@ local function mergeLua(baseStructure, overlayStructure)
         footer = baseStructure.footer
     }
     
-    -- Merge functions
     for funcName, funcContent in pairs(baseStructure.functions) do
         merged.functions[funcName] = funcContent
     end
@@ -526,7 +505,6 @@ local function mergeLua(baseStructure, overlayStructure)
         end
     end
     
-    -- Merge exports
     for exportName, exportValue in pairs(baseStructure.exports) do
         merged.exports[exportName] = exportValue
     end
@@ -540,12 +518,10 @@ end
 local function generateLuaContent(structure)
     local content = structure.header .. "\n\n"
     
-    -- Add functions
     for funcName, funcContent in pairs(structure.functions) do
         content = content .. funcContent .. "\n\n"
     end
     
-    -- Add exports
     content = content .. "-- public interface\n"
     for exportName, exportValue in pairs(structure.exports) do
         content = content .. "M." .. exportName .. " = " .. exportValue .. "\n"
@@ -568,7 +544,6 @@ local function mergeJson(base, overlay)
             if isArray(value) and isArray(result[key]) then
                 result[key] = mergeArrays(result[key], value, key)
             else
-                -- Recursively merge nested objects
                 result[key] = mergeJson(result[key], value)
             end
         else
@@ -583,8 +558,31 @@ local function mergeConflictingFiles(filePath, modsList)
     local isLuaFile = filePath:lower():endswith('.lua')
     local mergedData = nil
     local sourceMods = {}
+
+    local function processContent(content, modName)
+        table.insert(sourceMods, modName)
+
+        if isLuaFile then
+            local luaStructure = parseLuaFile(content)
+            if mergedData == nil then
+                mergedData = luaStructure
+            else
+                mergedData = mergeLua(mergedData, luaStructure)
+            end
+        else
+            local success, jsonData = pcall(jsonDecode, content)
+            if success then
+                if mergedData == nil then
+                    mergedData = jsonData
+                else
+                    mergedData = mergeJson(mergedData, jsonData)
+                end
+            else
+                log('E', 'ConflictResolver', 'Failed to parse JSON in ' .. filePath .. ' from mod ' .. modName)
+            end
+        end
+    end
     
-    -- Group mods by ZIP file for batch processing
     local zipGroups = {}
     local unpackedMods = {}
     
@@ -600,71 +598,21 @@ local function mergeConflictingFiles(filePath, modsList)
         end
     end
     
-    -- Process ZIP files in batches
     for zipPath, zipMods in pairs(zipGroups) do
-        local filePaths = {}
-        for i = 1, #zipMods do
-            table.insert(filePaths, filePath)
-        end
-        
-        local batchResults = batchReadFromZip(zipPath, filePaths)
-        local fileContent = batchResults[filePath]
-        
+        local modInfo = zipMods[1]
+        local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName)
+
         if fileContent then
-            for _, modInfo in ipairs(zipMods) do
-                local cacheKey = modInfo.modName .. ":" .. filePath
-                fileContentCache[cacheKey] = fileContent
-                
-                table.insert(sourceMods, modInfo.modName)
-                
-                if isLuaFile then
-                    local luaStructure = parseLuaFile(fileContent)
-                    if mergedData == nil then
-                        mergedData = luaStructure
-                    else
-                        mergedData = mergeLua(mergedData, luaStructure)
-                    end
-                else
-                    local success, jsonData = pcall(jsonDecode, fileContent)
-                    if success then
-                        if mergedData == nil then
-                            mergedData = jsonData
-                        else
-                            mergedData = mergeJson(mergedData, jsonData)
-                        end
-                    else
-                        log('E', 'ConflictResolver', 'Failed to parse JSON in ' .. filePath .. ' from mod ' .. modInfo.modName)
-                    end
-                end
+            for _, mod in ipairs(zipMods) do
+                processContent(fileContent, mod.modName)
             end
         end
     end
     
-    -- Process unpacked mods
     for _, modInfo in ipairs(unpackedMods) do
         local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName)
         if fileContent then
-            table.insert(sourceMods, modInfo.modName)
-            
-            if isLuaFile then
-                local luaStructure = parseLuaFile(fileContent)
-                if mergedData == nil then
-                    mergedData = luaStructure
-                else
-                    mergedData = mergeLua(mergedData, luaStructure)
-                end
-            else
-                local success, jsonData = pcall(jsonDecode, fileContent)
-                if success then
-                    if mergedData == nil then
-                        mergedData = jsonData
-                    else
-                        mergedData = mergeJson(mergedData, jsonData)
-                    end
-                else
-                    log('E', 'ConflictResolver', 'Failed to parse JSON in ' .. filePath .. ' from mod ' .. modInfo.modName)
-                end
-            end
+            processContent(fileContent, modInfo.modName)
         end
     end
     
@@ -698,7 +646,6 @@ local function mergeConflictingFiles(filePath, modsList)
 end
 
 local function resolveConflicts(forceRun)
-    -- Debounce rapid calls unless forced
     local currentTime = os.time()
     if not forceRun and (currentTime - lastResolutionTime) < RESOLUTION_DEBOUNCE_TIME then
         return {
@@ -713,7 +660,7 @@ local function resolveConflicts(forceRun)
     
     local conflicts = findFileConflicts()
     local resolvedCount = 0
-    local totalConflicts = tableSize and tableSize(conflicts) or tableSizeHelper(conflicts)
+    local totalConflicts = tableSize(conflicts)
     
     if totalConflicts == 0 then
         return {
@@ -724,7 +671,6 @@ local function resolveConflicts(forceRun)
         }
     end
     
-    -- Resolve each conflict
     for filePath, modsList in pairs(conflicts) do
         if mergeConflictingFiles(filePath, modsList) then
             resolvedCount = resolvedCount + 1
@@ -741,7 +687,6 @@ local function resolveConflicts(forceRun)
     local message = string.format("Resolved %d/%d conflicts", resolvedCount, totalConflicts)
     log('I', 'ConflictResolver', message)
     
-    -- Mount resolver and notify of changes
     if resolvedCount > 0 then
         if mountConflictResolver() then
             local changedFiles = {}
@@ -789,7 +734,6 @@ local function clearResolvedConflicts()
     end
 end
 
--- Mod activation/deactivation hooks
 local function onModActivated(modData)
     if modData and modData.modname then
         clearModCache(modData.modname)
@@ -806,7 +750,6 @@ local function onModDeactivated(modData)
     resolveConflicts()
 end
 
--- Public API
 M.resolveConflicts = resolveConflicts
 M.getConflictStatus = getConflictStatus
 M.clearResolvedConflicts = clearResolvedConflicts
@@ -819,11 +762,10 @@ M.onModDeactivated = onModDeactivated
 M.clearAllCaches = clearAllCaches
 
 M.getCacheStats = function()
-    local sizeFn = tableSize or tableSizeHelper
     local stats = {
-        modFileCache = sizeFn(modFileCache),
-        zipFileListCache = sizeFn(zipFileListCache),
-        fileContentCache = sizeFn(fileContentCache),
+        modFileCache = tableSize(modFileCache),
+        zipFileListCache = tableSize(zipFileListCache),
+        fileContentCache = tableSize(fileContentCache),
         totalCacheEntries = 0
     }
     stats.totalCacheEntries = stats.modFileCache + stats.zipFileListCache + stats.fileContentCache
@@ -831,7 +773,7 @@ M.getCacheStats = function()
 end
 
 M.setCacheValidityTime = function(seconds)
-    CACHE_VALIDITY_TIME = math.max(10, seconds) -- Minimum 10 seconds
+    CACHE_VALIDITY_TIME = math.max(10, seconds)
 end
 
 M.setDebugLogging = function(enabled)
