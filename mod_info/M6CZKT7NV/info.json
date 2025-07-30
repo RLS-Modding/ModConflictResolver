@@ -1,0 +1,43 @@
+{
+    "attachments": [
+        {
+            "data_filename": "1244182.png",
+            "original_filename": "upload_2025-7-19_0-56-25.png",
+            "thumb_filename": "thumbs\/1244182.jpg"
+        }
+    ],
+    "resource_id": 35277,
+    "current_version_id": 63250,
+    "download_count": 0,
+    "resource_version_id": 63250,
+    "version_string": "0.1",
+    "last_update": 1752901042,
+    "rating_avg": 0,
+    "rating_count": 0,
+    "rating_sum": 0,
+    "resource_category_id": 7,
+    "resource_date": 1752901042,
+    "review_count": 0,
+    "tag_line": "Smart conflict resolver for BeamNG mod files",
+    "update_count": 0,
+    "path": "M6CZKT7NV\/63250\/",
+    "filename": "ModConflictResolver.zip",
+    "title": "Mod Conflict Resolver",
+    "user_id": 608931,
+    "username": "N0THATGUY",
+    "tagid": "M6CZKT7NV",
+    "message": "[B][SIZE=6]Mod Conflict Resolver[\/SIZE][\/B]\n\nEver had one mod overwrite another? Missing features because two mods touched the same files? [B]This tool fixes that.[\/B]\n\n[SIZE=4][U] What It Does[\/U][\/SIZE]\n\nThis mod automatically detects and resolves conflicts between active mods that try to edit the same files\u2014like keyboard binding configs (`.json`) or behavior scripts (`.lua`).\n\n[SIZE=4][U] Key Features[\/U][\/SIZE]\n\n[LIST]\n[*][B]Finds Conflicts:[\/B] Scans all active mods for duplicate file paths (e.g., `\/vehicles\/etki\/input_actions.json`).\n[*][B]Smart Merging:[\/B]\n[LIST]\n[*]Performs [I]deep merges[\/I] of conflicting [B]JSON files[\/B], such as custom keybinds. If two mods add different bindings to the same car, you\u2019ll get [B]both[\/B].\n[*]Analyzes and merges [B]Lua scripts[\/B], combining logic from different mods (for supported vehicle script patterns).\n[\/LIST]\n[*][B]Creates a New Merged Mod:[\/B] Saves the result to `[I]\/mods\/ModConflictResolutions\/[\/I]`, which loads as a high-priority patch.\n[*][B]Automatic and Background Friendly:[\/B] Re-evaluates conflicts every time you enable\/disable a mod.\n[\/LIST]\n\n[SIZE=4][U] Example[\/U][\/SIZE]\n\nSay one mod adds a custom horn keybind to a car, and another mod adds a boost activation keybind. Normally, the last mod loaded would overwrite the other\u2014[B]you\u2019d lose one feature[\/B]. With this resolver, [B]both bindings are preserved and fully functional[\/B].\n[ATTACH=full]1244182[\/ATTACH]\n\n[SIZE=4][U] Installation[\/U][\/SIZE]\n\nJust install like a normal mod\u2014no setup needed. It will start resolving conflicts as soon as it\u2019s enabled.\n\n[SIZE=4][U] TLDR [\/U][\/SIZE]\n\nThis tool is a must-have for heavy mod users or developers who want maximum compatibility. It keeps the game stable and makes sure no good feature goes to waste.",
+    "category_title": "",
+    "prefix_title": "Beta",
+    "via": "packed by repo on Mon, 21 Jul 2025 01:04:09 GMT",
+    "hashes": [
+        [
+            "scripts\/ModConflictResolver\/modScript.lua",
+            "33073090cbe89aca"
+        ],
+        [
+            "lua\/ge\/conflictResolver.lua",
+            "4011bc5142b89a73"
+        ]
+    ]
+}
