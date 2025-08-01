@@ -18,6 +18,9 @@ local modFileCache = {}
 local zipFileListCache = {}
 local fileContentCache = {}
 local pathInternCache = {}
+local fileAstCache = {}
+local fileAstCacheSize = 0
+local MAX_AST_CACHE_SIZE = 128
 
 local function tableSize(t)
     if _G.tableSize then
@@ -223,6 +226,46 @@ local function batchReadFromZip(zipPath, filePaths)
     return results
 end
 
+local function detectJsonFormat(content, filePath)
+    if not content or content == "" then
+        return false
+    end
+    
+    local sampleSize = math.min(#content, JSON_DETECTION_SAMPLE_SIZE)
+    local sample = content:sub(1, sampleSize)
+    
+    local braceDepth = 0
+    local objectCount = 0
+    local inString = false
+    local escapeNext = false
+    
+    for i = 1, #sample do
+        local char = sample:sub(i, i)
+        
+        if escapeNext then
+            escapeNext = false
+        elseif char == "\\" and inString then
+            escapeNext = true
+        elseif char == '"' then
+            inString = not inString
+        elseif not inString then
+            if char == "{" then
+                braceDepth = braceDepth + 1
+            elseif char == "}" then
+                braceDepth = braceDepth - 1
+                if braceDepth == 0 then
+                    objectCount = objectCount + 1
+                    if objectCount > 1 then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    
+    return objectCount > 1
+end
+
 local function buildManifest(modData, manifestPath, modName)
     local entries = {}
     local startTime = os.time()
@@ -234,10 +277,24 @@ local function buildManifest(modData, manifestPath, modName)
             if isSupportedFileType(filePath) then
                 local content = readFileFromMod(filePath, modData, modName)
                 local hash = computeFileHash(content)
-                table.insert(entries, {
+                local entry = {
                     path = internPath(filePath),
                     hash = hash
-                })
+                }
+                
+                -- Add partHash for JSON-Lines files
+                if content and detectJsonFormat(content, filePath) then
+                    local partHashes = {}
+                    for line in content:gmatch("[^\r\n]+") do
+                        local trimmedLine = line:match("^%s*(.-)%s*$")
+                        if trimmedLine ~= "" then
+                            table.insert(partHashes, computeFileHash(trimmedLine))
+                        end
+                    end
+                    entry.partHashes = partHashes
+                end
+                
+                table.insert(entries, entry)
                 if content then
                     fileContentCache[hash] = content
                 end
@@ -252,10 +309,24 @@ local function buildManifest(modData, manifestPath, modName)
             if isSupportedFileType(relativePath) then
                 local content = readFile(fullPath)
                 local hash = computeFileHash(content)
-                table.insert(entries, {
+                local entry = {
                     path = internPath(relativePath),
                     hash = hash
-                })
+                }
+                
+                -- Add partHash for JSON-Lines files
+                if content and detectJsonFormat(content, relativePath) then
+                    local partHashes = {}
+                    for line in content:gmatch("[^\r\n]+") do
+                        local trimmedLine = line:match("^%s*(.-)%s*$")
+                        if trimmedLine ~= "" then
+                            table.insert(partHashes, computeFileHash(trimmedLine))
+                        end
+                    end
+                    entry.partHashes = partHashes
+                end
+                
+                table.insert(entries, entry)
                 if content then
                     fileContentCache[hash] = content
                 end
@@ -279,10 +350,24 @@ local function buildManifest(modData, manifestPath, modName)
         local batchContent = batchReadFromZip(modData.fullpath, zipPaths)
         for filePath, content in pairs(batchContent) do
             local hash = computeFileHash(content)
-            table.insert(entries, {
+            local entry = {
                 path = internPath(filePath),
                 hash = hash
-            })
+            }
+            
+            -- Add partHash for JSON-Lines files
+            if content and detectJsonFormat(content, filePath) then
+                local partHashes = {}
+                for line in content:gmatch("[^\r\n]+") do
+                    local trimmedLine = line:match("^%s*(.-)%s*$")
+                    if trimmedLine ~= "" then
+                        table.insert(partHashes, computeFileHash(trimmedLine))
+                    end
+                end
+                entry.partHashes = partHashes
+            end
+            
+            table.insert(entries, entry)
             if content then
                 fileContentCache[hash] = content
             end
@@ -372,6 +457,29 @@ local function clearModCache(modName)
     end
 end
 
+local function addToAstCache(hash, ast)
+    if fileAstCacheSize >= MAX_AST_CACHE_SIZE then
+        -- Simple FIFO eviction: remove half the cache
+        local newCache = {}
+        local newSize = 0
+        local count = 0
+        for h, a in pairs(fileAstCache) do
+            count = count + 1
+            if count > MAX_AST_CACHE_SIZE / 2 then
+                newCache[h] = a
+                newSize = newSize + 1
+            end
+        end
+        fileAstCache = newCache
+        fileAstCacheSize = newSize
+    end
+    
+    if not fileAstCache[hash] then
+        fileAstCacheSize = fileAstCacheSize + 1
+    end
+    fileAstCache[hash] = ast
+end
+
 local function clearAllCaches()
     modFileCache = {}
     zipFileListCache = {}
@@ -379,6 +487,8 @@ local function clearAllCaches()
     pathInternCache = {}
     modSnapshot = {}
     globalFileToMods = {}
+    fileAstCache = {}
+    fileAstCacheSize = 0
     
     if FS:directoryExists(MANIFEST_DIR) then
         local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
@@ -396,10 +506,11 @@ local function getCacheStats()
         pathInternCache = tableSize(pathInternCache),
         modSnapshot = tableSize(modSnapshot),
         globalFileToMods = tableSize(globalFileToMods),
+        fileAstCache = fileAstCacheSize,
         totalCacheEntries = 0
     }
     stats.totalCacheEntries = stats.modFileCache + stats.zipFileListCache + stats.fileContentCache + 
-                              stats.pathInternCache + stats.modSnapshot + stats.globalFileToMods
+                              stats.pathInternCache + stats.modSnapshot + stats.globalFileToMods + stats.fileAstCache
     
     if FS:directoryExists(MANIFEST_DIR) then
         local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
@@ -598,52 +709,18 @@ local function recordResolution(filePath, modsList, outputHash, index)
     }
 end
 
-local function detectJsonFormat(content, filePath)
-    if not content or content == "" then
-        return false
-    end
-    
-    local sampleSize = math.min(#content, JSON_DETECTION_SAMPLE_SIZE)
-    local sample = content:sub(1, sampleSize)
-    
-    local braceDepth = 0
-    local objectCount = 0
-    local inString = false
-    local escapeNext = false
-    
-    for i = 1, #sample do
-        local char = sample:sub(i, i)
-        
-        if escapeNext then
-            escapeNext = false
-        elseif char == "\\" and inString then
-            escapeNext = true
-        elseif char == '"' then
-            inString = not inString
-        elseif not inString then
-            if char == "{" then
-                braceDepth = braceDepth + 1
-            elseif char == "}" then
-                braceDepth = braceDepth - 1
-                if braceDepth == 0 then
-                    objectCount = objectCount + 1
-                    if objectCount > 1 then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    
-    return objectCount > 1
-end
-
 local function parseJsonContent(content, filePath, modName)
-    local objects = {}
-    
     if not content or content == "" then
-        return objects
+        return {}
     end
+    
+    -- Parsed-JSON LRU cache optimization: check cache first
+    local contentHash = computeFileHash(content)
+    if fileAstCache[contentHash] then
+        return fileAstCache[contentHash]
+    end
+    
+    local objects = {}
     
     if detectJsonFormat(content, filePath) then
         for line in content:gmatch("[^\r\n]+") do
@@ -663,11 +740,19 @@ local function parseJsonContent(content, filePath, modName)
         end
     end
     
+    -- Cache the parsed result
+    addToAstCache(contentHash, objects)
+    
     return objects
 end
 
 local function generateUniqueKey(obj)
-        local idKeys = {"persistentId", "id", "uuid", "guid"}
+    -- Pre-computed cache key optimization: use cached __key if available
+    if obj.__key then
+        return obj.__key
+    end
+    
+    local idKeys = {"persistentId", "id", "uuid", "guid"}
     local nameKeys = {"name", "title", "label"}
     local positionKeys = {"position", "pos", "location", "transform"}
     local rotationKeys = {"rotationMatrix", "rotation", "rot", "orientation"}
@@ -747,14 +832,48 @@ local function generateUniqueKey(obj)
         end
     end
     
+    local key
     if #keyParts == 0 then
-        return jsonEncode(obj)
+        key = jsonEncode(obj)
+    else
+        key = table.concat(keyParts, ":")
     end
     
-    return table.concat(keyParts, ":")
+    -- Cache the key on the object
+    obj.__key = key
+    return key
 end
 
-local function mergeJsonLines(allObjects, filePath)
+local function allPartHashesEqual(modsList)
+    if #modsList <= 1 then return true end
+    
+    local firstEntry = modsList[1]
+    if not firstEntry.partHashes then
+        return false
+    end
+    
+    for i = 2, #modsList do
+        local entry = modsList[i]
+        if not entry.partHashes or #entry.partHashes ~= #firstEntry.partHashes then
+            return false
+        end
+        
+        for j = 1, #firstEntry.partHashes do
+            if firstEntry.partHashes[j] ~= entry.partHashes[j] then
+                return false
+            end
+        end
+    end
+    
+    return true
+end
+
+local function mergeJsonLines(allObjects, filePath, modsList)
+    -- Fast path: if all part hashes are equal, objects are identical
+    if modsList and allPartHashesEqual(modsList) then
+        return allObjects
+    end
+    
     local mergedObjects = {}
     local seenObjects = {}
     
@@ -775,25 +894,16 @@ local function mergeSingleJsonObjects(base, overlay, filePath)
         return overlay
     end
     
-    local result = {}
-    
-    for key, value in pairs(base) do
-        if type(value) == "table" then
-            result[key] = mergeSingleJsonObjects(value, {}, filePath) -- Deep copy
-        else
-            result[key] = value
-        end
-    end
-    
+    -- In-place mutation optimization: modify base directly instead of creating new table
     for key, value in pairs(overlay) do
-        if type(value) == "table" and type(result[key]) == "table" then
-            result[key] = mergeSingleJsonObjects(result[key], value, filePath)
+        if type(value) == "table" and type(base[key]) == "table" then
+            base[key] = mergeSingleJsonObjects(base[key], value, filePath)
         else
-            result[key] = value
+            base[key] = value
         end
     end
     
-    return result
+    return base
 end
 
 local function analyzeKeyOrder(allObjects)
@@ -915,21 +1025,23 @@ local function mergeArrays(baseArray, overlayArray, arrayKey)
     local result = deepcopy(baseArray)
     
     if arrayKey == "bindings" then
+        -- O(n+m) optimization: use hash table for seen bindings
+        local seen = {}
+        for _, baseItem in ipairs(result) do
+            local key = (baseItem.control or "") .. ":" .. (baseItem.action or "")
+            seen[key] = true
+        end
+        
         for _, overlayItem in ipairs(overlayArray) do
-            local isDuplicate = false
-            for _, baseItem in ipairs(result) do
-                if bindingsEqual(baseItem, overlayItem) then
-                    isDuplicate = true
-                    break
-                end
-            end
-            if not isDuplicate then
-                table.insert(result, overlayItem)
+            local key = (overlayItem.control or "") .. ":" .. (overlayItem.action or "")
+            if not seen[key] then
+                seen[key] = true
+                result[#result + 1] = overlayItem
             end
         end
     else
         for _, item in ipairs(overlayArray) do
-            table.insert(result, item)
+            result[#result + 1] = item
         end
     end
     
@@ -1192,25 +1304,50 @@ local function findFileConflicts()
     local activeMods = getActiveMods()
     local conflicts = {}
     
+    -- Flatten conflict scan optimization: combine mod data attachment and updateGlobalFileToMods in single pass
     for modName, modData in pairs(activeMods) do
         local currentSnapshot = modSnapshot[modName]
+        local entries
+        
         if not currentSnapshot then
-            local entries = getModFiles(modData, modName)
-            updateGlobalFileToMods(modName, entries)
+            entries = getModFiles(modData, modName)
         else
             local manifestPath = MANIFEST_DIR .. sanitizeModName(modName) .. ".json"
             if manifestIsStale(modData, manifestPath) then
-                local entries = getModFiles(modData, modName)
-                updateGlobalFileToMods(modName, entries)
+                entries = getModFiles(modData, modName)
+            else
+                entries = currentSnapshot.entries
             end
         end
         
-        for filePath, modsList in pairs(globalFileToMods) do
-            for _, modInfo in ipairs(modsList) do
-                if modInfo.modName == modName then
-                    modInfo.modData = modData
+        -- Combined update: add entries to globalFileToMods and attach modData in one pass
+        for _, entry in ipairs(entries) do
+            local filePath = entry.path
+            if not globalFileToMods[filePath] then
+                globalFileToMods[filePath] = {}
+            end
+            
+            local found = false
+            for i, existing in ipairs(globalFileToMods[filePath]) do
+                if existing.modName == modName then
+                    globalFileToMods[filePath][i] = {
+                        modName = modName,
+                        modData = modData,
+                        hash = entry.hash,
+                        partHashes = entry.partHashes
+                    }
+                    found = true
                     break
                 end
+            end
+            
+            if not found then
+                table.insert(globalFileToMods[filePath], {
+                    modName = modName,
+                    modData = modData,
+                    hash = entry.hash,
+                    partHashes = entry.partHashes
+                })
             end
         end
     end
@@ -1343,7 +1480,7 @@ local function mergeConflictingFiles(filePath, modsList)
     
     if isJsonFile and #allObjects > 0 then
         if isJsonLines then
-            local mergedObjects = mergeJsonLines(allObjects, filePath)
+            local mergedObjects = mergeJsonLines(allObjects, filePath, modsList)
             local jsonContent = objectsToJsonFormat(mergedObjects, filePath, true)
             mergedData = jsonContent
         else
