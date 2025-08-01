@@ -27,8 +27,8 @@ local zipCacheSize = 0
 local MAX_ZIP_CACHE_SIZE = 16
 
 local conflictStartTime = 0
-local globalFileIndex = {} -- Quick index: filename -> list of mod names
-local processedHashes = {} -- Hash-based duplicate detection cache
+local globalFileIndex = {}
+local processedHashes = {}
 
 local function tableSize(t)
     if _G.tableSize then
@@ -59,7 +59,6 @@ end
 local function normalizePath(path)
     if not path then return "" end
     
-    -- Path normalization cache optimization: cache expensive string operations
     if pathNormalizeCache[path] then
         return pathNormalizeCache[path]
     end
@@ -148,7 +147,6 @@ local function getCachedZip(zipPath)
         return openZipCache[zipPath]
     end
     
-    -- Simple FIFO eviction for ZIP cache
     if zipCacheSize >= MAX_ZIP_CACHE_SIZE then
         local toRemove = {}
         local count = 0
@@ -206,21 +204,96 @@ end
 local function computeFileHash(content)
     if not content then return "0" end
     
+    local len = #content
+    if len == 0 then return "0" end
+    
+    if len <= 1024 then
+        local hash = 5381
+        for i = 1, len do
+            hash = ((hash * 33) + string.byte(content, i)) % 2147483647
+        end
+        return tostring(hash)
+    end
+    
     local hash = 5381
-    for i = 1, #content do
+    
+    hash = ((hash * 33) + len) % 2147483647
+    
+    for i = 1, math.min(256, len) do
         hash = ((hash * 33) + string.byte(content, i)) % 2147483647
     end
+    
+    local midStart = math.floor(len / 2) - 128
+    for i = midStart, math.min(midStart + 255, len) do
+        if i > 0 then
+            hash = ((hash * 33) + string.byte(content, i)) % 2147483647
+        end
+    end
+    
+    for i = math.max(1, len - 255), len do
+        hash = ((hash * 33) + string.byte(content, i)) % 2147483647
+    end
+    
     return tostring(hash)
+end
+
+local filePathCache = {}
+local hashCache = {}
+local MAX_CACHE_SIZE = 10000
+local cacheAccessCount = 0
+
+local function cleanupCaches()
+    cacheAccessCount = cacheAccessCount + 1
+    if cacheAccessCount % 1000 == 0 then
+        local pathCacheSize = tableSize(filePathCache)
+        local hashCacheSize = tableSize(hashCache)
+        
+        if pathCacheSize > MAX_CACHE_SIZE then
+            local toRemove = pathCacheSize - MAX_CACHE_SIZE
+            local removed = 0
+            for key, entry in pairs(filePathCache) do
+                if removed >= toRemove then break end
+                if entry.timestamp and (os.time() - entry.timestamp) > 300 then
+                    filePathCache[key] = nil
+                    removed = removed + 1
+                end
+            end
+        end
+        
+        if hashCacheSize > MAX_CACHE_SIZE then
+            local keys = {}
+            for k in pairs(hashCache) do
+                table.insert(keys, k)
+            end
+            local toRemove = math.floor(#keys * 0.3)
+            for i = 1, toRemove do
+                hashCache[keys[i]] = nil
+            end
+        end
+    end
 end
 
 local function readFileFromMod(filePath, modData, modName, expectedHash)
     filePath = normalizePath(filePath)
     
+    cleanupCaches()
+    
     if expectedHash and fileContentCache[expectedHash] then
         return fileContentCache[expectedHash]
     end
     
+    local cacheKey = modName .. ":" .. filePath
+    local cached = filePathCache[cacheKey]
+    if cached then
+        cached.timestamp = os.time()
+        if cached.content and cached.hash and not fileContentCache[cached.hash] then
+            fileContentCache[cached.hash] = cached.content
+        end
+        return cached.content
+    end
+    
     local content = nil
+    local startTime = hptimer()
     
     if modData.unpackedPath then
         local fullPath = modData.unpackedPath .. filePath
@@ -242,9 +315,32 @@ local function readFileFromMod(filePath, modData, modName, expectedHash)
         end
     end
     
+    local ioTime = startTime:stop()
+    
     if content then
+        local hashStartTime = hptimer()
         local hash = expectedHash or computeFileHash(content)
+        local hashTime = hashStartTime:stop()
+        
         fileContentCache[hash] = content
+        filePathCache[cacheKey] = {
+            content = content,
+            hash = hash,
+            timestamp = os.time(),
+            ioTime = ioTime,
+            hashTime = hashTime
+        }
+        
+        if not expectedHash then
+            hashCache[cacheKey] = hash
+        end
+    else
+        filePathCache[cacheKey] = {
+            content = nil,
+            hash = nil,
+            timestamp = os.time(),
+            ioTime = ioTime
+        }
     end
     
     return content
@@ -330,7 +426,6 @@ local function buildManifest(modData, manifestPath, modName)
         for _, hashData in ipairs(modData.modData.hashes) do
             local filePath = normalizePath(hashData[1])
             if isSupportedFileType(filePath) then
-                -- Hash-based duplicate detection: skip if we've already processed this exact file
                 local fileKey = filePath .. ":" .. (hashData[2] or "")
                 if processedHashes[fileKey] then
                     local entry = {
@@ -348,9 +443,6 @@ local function buildManifest(modData, manifestPath, modName)
                         hash = hash
                     }
                     
-                    -- Skip partHash computation during manifest building - compute lazily when conflicts detected
-                    -- This saves significant time during initial scanning
-                    
                     table.insert(entries, entry)
                     if content then
                         fileContentCache[hash] = content
@@ -367,7 +459,6 @@ local function buildManifest(modData, manifestPath, modName)
             local relativePath = fullPath:gsub(modData.unpackedPath, "")
             relativePath = normalizePath(relativePath)
             if isSupportedFileType(relativePath) then
-                -- Hash-based duplicate detection: check if we've already processed this file
                 local stat = FS:stat(fullPath)
                 local fileKey = relativePath .. ":" .. (stat and stat.modtime or "0")
                 
@@ -386,9 +477,6 @@ local function buildManifest(modData, manifestPath, modName)
                         path = internPath(relativePath),
                         hash = hash
                     }
-                    
-                    -- Skip partHash computation during manifest building - compute lazily when conflicts detected
-                    -- This saves significant time during initial scanning
                     
                     table.insert(entries, entry)
                     if content then
@@ -418,7 +506,6 @@ local function buildManifest(modData, manifestPath, modName)
         
         local batchContent = batchReadFromZip(modData.fullpath, zipPaths)
         for filePath, content in pairs(batchContent) do
-            -- Hash-based duplicate detection: use ZIP path + content hash as key
             local contentHash = computeFileHash(content)
             local fileKey = filePath .. ":" .. contentHash
             
@@ -430,16 +517,12 @@ local function buildManifest(modData, manifestPath, modName)
                     hash = contentHash
                 }
                 
-                -- Skip partHash computation during manifest building - compute lazily when conflicts detected
-                -- This saves significant time during initial scanning
-                
                 table.insert(entries, entry)
                 if content then
                     fileContentCache[contentHash] = content
                 end
                 processedFiles = processedFiles + 1
             else
-                -- Already processed this exact file content
                 local entry = {
                     path = internPath(filePath),
                     hash = processedHashes[fileKey]
@@ -537,7 +620,6 @@ end
 
 local function addToAstCache(hash, ast)
     if fileAstCacheSize >= MAX_AST_CACHE_SIZE then
-        -- Simple FIFO eviction: remove half the cache
         local newCache = {}
         local newSize = 0
         local count = 0
@@ -593,12 +675,14 @@ local function getCacheStats()
         processedHashes = tableSize(processedHashes),
         fileAstCache = fileAstCacheSize,
         openZipCache = zipCacheSize,
+        filePathCache = tableSize(filePathCache),
+        hashCache = tableSize(hashCache),
         totalCacheEntries = 0
     }
     stats.totalCacheEntries = stats.modFileCache + stats.zipFileListCache + stats.fileContentCache + 
                               stats.pathInternCache + stats.pathNormalizeCache + stats.modSnapshot + 
                               stats.globalFileToMods + stats.globalFileIndex + stats.processedHashes + 
-                              stats.fileAstCache + stats.openZipCache
+                              stats.fileAstCache + stats.openZipCache + stats.filePathCache + stats.hashCache
     
     if FS:directoryExists(MANIFEST_DIR) then
         local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
@@ -802,7 +886,6 @@ local function parseJsonContent(content, filePath, modName)
         return {}
     end
     
-    -- Parsed-JSON LRU cache optimization: check cache first
     local contentHash = computeFileHash(content)
     if fileAstCache[contentHash] then
         return fileAstCache[contentHash]
@@ -828,14 +911,12 @@ local function parseJsonContent(content, filePath, modName)
         end
     end
     
-    -- Cache the parsed result
     addToAstCache(contentHash, objects)
     
     return objects
 end
 
 local function generateUniqueKey(obj)
-    -- Pre-computed cache key optimization: use cached __key if available
     if obj.__key then
         return obj.__key
     end
@@ -927,7 +1008,6 @@ local function generateUniqueKey(obj)
         key = table.concat(keyParts, ":")
     end
     
-    -- Cache the key on the object
     obj.__key = key
     return key
 end
@@ -958,10 +1038,9 @@ end
 local function allPartHashesEqual(modsList, filePath)
     if #modsList <= 1 then return true end
     
-    -- Lazy computation: compute partHashes only when needed for conflict detection
     local firstPartHashes = computePartHashesForEntry(modsList[1], filePath)
     if #firstPartHashes == 0 then
-        return false -- Not a JSON-Lines file
+        return false
     end
     
     for i = 2, #modsList do
@@ -981,7 +1060,6 @@ local function allPartHashesEqual(modsList, filePath)
 end
 
 local function mergeJsonLines(allObjects, filePath, modsList)
-    -- Fast path: if all part hashes are equal, objects are identical
     if modsList and allPartHashesEqual(modsList, filePath) then
         return allObjects
     end
@@ -1006,7 +1084,6 @@ local function mergeSingleJsonObjects(base, overlay, filePath)
         return overlay
     end
     
-    -- In-place mutation optimization: modify base directly instead of creating new table
     for key, value in pairs(overlay) do
         if type(value) == "table" and type(base[key]) == "table" then
             base[key] = mergeSingleJsonObjects(base[key], value, filePath)
@@ -1137,7 +1214,6 @@ local function mergeArrays(baseArray, overlayArray, arrayKey)
     local result = deepcopy(baseArray)
     
     if arrayKey == "bindings" then
-        -- O(n+m) optimization: use hash table for seen bindings
         local seen = {}
         for _, baseItem in ipairs(result) do
             local key = (baseItem.control or "") .. ":" .. (baseItem.action or "")
@@ -1418,12 +1494,10 @@ local function quickScanForPotentialConflicts(activeMods)
     
     log('I', 'ConflictResolver', 'Quick scanning ' .. tableSize(activeMods) .. ' mods for potential conflicts...')
     
-    -- Lightweight scan: just get file lists without building full manifests
     for modName, modData in pairs(activeMods) do
         local fileList = {}
         
         if modData.modData and modData.modData.hashes then
-            -- Use existing hash data for quick scan
             for _, hashData in ipairs(modData.modData.hashes) do
                 local filePath = normalizePath(hashData[1])
                 if isSupportedFileType(filePath) then
@@ -1431,7 +1505,6 @@ local function quickScanForPotentialConflicts(activeMods)
                 end
             end
         elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
-            -- Quick directory scan
             local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
             for _, fullPath in ipairs(modFiles) do
                 local relativePath = fullPath:gsub(modData.unpackedPath, "")
@@ -1441,7 +1514,6 @@ local function quickScanForPotentialConflicts(activeMods)
                 end
             end
         elseif modData.fullpath and FS:fileExists(modData.fullpath) then
-            -- Quick ZIP scan
             local zipFileMap = getZipFileMap(modData.fullpath)
             for filePath, _ in pairs(zipFileMap) do
                 local normalized = normalizePath(filePath)
@@ -1451,7 +1523,6 @@ local function quickScanForPotentialConflicts(activeMods)
             end
         end
         
-        -- Track which mods have which files
         for _, filePath in ipairs(fileList) do
             if not fileToModNames[filePath] then
                 fileToModNames[filePath] = {}
@@ -1460,7 +1531,6 @@ local function quickScanForPotentialConflicts(activeMods)
         end
     end
     
-    -- Identify mods that have potentially conflicting files and track unique files for exclusion
     local uniqueFiles = {}
     for filePath, modNames in pairs(fileToModNames) do
         if #modNames > 1 then
@@ -1468,7 +1538,6 @@ local function quickScanForPotentialConflicts(activeMods)
                 potentiallyConflictingMods[modName] = true
             end
         else
-            -- Early unique file detection: mark files that exist in only one mod
             uniqueFiles[filePath] = true
         end
     end
@@ -1483,26 +1552,49 @@ local function quickScanForPotentialConflicts(activeMods)
     log('I', 'ConflictResolver', string.format('Identified %d/%d unique files to skip (%.1f%% file reduction)', 
         uniqueFileCount, totalFileCount, (uniqueFileCount/totalFileCount) * 100))
     
-    -- Store unique files globally for later exclusion
     globalFileIndex.uniqueFiles = uniqueFiles
     
     return potentiallyConflictingMods
+end
+
+local function processConflictsAfterJobs(activeMods, quickConflictMap)
+    local conflicts = {}
+    
+    for filePath, hashList in pairs(quickConflictMap) do
+        if #hashList > 1 then
+            local fullModsList = {}
+            for _, hashEntry in ipairs(hashList) do
+                local modData = activeMods[hashEntry.modName]
+                if modData then
+                    table.insert(fullModsList, {
+                        modName = hashEntry.modName,
+                        modData = modData,
+                        hash = hashEntry.hash
+                    })
+                end
+            end
+            
+            if #fullModsList > 1 then
+                conflicts[filePath] = fullModsList
+                
+                globalFileToMods[filePath] = fullModsList
+            end
+        end
+    end
+    
+    return conflicts
 end
 
 local function findFileConflicts()
     local activeMods = getActiveMods()
     local conflicts = {}
     
-    -- Skip non-conflicting mods optimization: only build detailed manifests for mods that might conflict
     local potentiallyConflictingMods = quickScanForPotentialConflicts(activeMods)
     
-    -- Conflict-first approach optimization: quick hash-only conflict detection before expensive operations
     local quickConflictMap = {}
     
-    -- First pass: detailed manifest building only for potentially conflicting mods
     for modName, modData in pairs(activeMods) do
         if not potentiallyConflictingMods[modName] then
-            -- Skip mods that have no potential conflicts
             goto continue
         end
         
@@ -1520,11 +1612,9 @@ local function findFileConflicts()
             end
         end
         
-        -- Build quick conflict map with hash-only data, skip unique files
         for _, entry in ipairs(entries) do
             local filePath = entry.path
             
-            -- Early unique file detection: skip files that are guaranteed unique
             if globalFileIndex.uniqueFiles and globalFileIndex.uniqueFiles[filePath] then
                 goto continue_entry
             end
@@ -1544,27 +1634,36 @@ local function findFileConflicts()
         ::continue::
     end
     
-    -- Second pass: only process files that actually have conflicts
     for filePath, hashList in pairs(quickConflictMap) do
         if #hashList > 1 then
-            -- This file has conflicts, build full conflict entry
-            local fullModsList = {}
-            for _, hashEntry in ipairs(hashList) do
-                local modData = activeMods[hashEntry.modName]
-                if modData then
-                    table.insert(fullModsList, {
-                        modName = hashEntry.modName,
-                        modData = modData,
-                        hash = hashEntry.hash
-                    })
+            local firstHash = hashList[1].hash
+            local hasRealConflict = false
+            
+            for i = 2, #hashList do
+                if hashList[i].hash ~= firstHash then
+                    hasRealConflict = true
+                    break
                 end
             end
             
-            if #fullModsList > 1 then
-                conflicts[filePath] = fullModsList
+            if hasRealConflict then
+                local fullModsList = {}
+                for _, hashEntry in ipairs(hashList) do
+                    local modData = activeMods[hashEntry.modName]
+                    if modData then
+                        table.insert(fullModsList, {
+                            modName = hashEntry.modName,
+                            modData = modData,
+                            hash = hashEntry.hash
+                        })
+                    end
+                end
                 
-                -- Update globalFileToMods only for conflicting files
-                globalFileToMods[filePath] = fullModsList
+                if #fullModsList > 1 then
+                    conflicts[filePath] = fullModsList
+                    
+                    globalFileToMods[filePath] = fullModsList
+                end
             end
         end
     end
@@ -1737,55 +1836,7 @@ local function mergeConflictingFiles(filePath, modsList)
     end
 end
 
-local function resolveConflicts(forceRun)
-    conflictStartTime = os.time()
-    local currentTime = os.time()
-    if not forceRun and (currentTime - lastResolutionTime) < RESOLUTION_DEBOUNCE_TIME then
-        return {
-            success = false,
-            message = "Skipped due to debounce",
-            resolvedCount = 0,
-            totalConflicts = 0
-        }
-    end
-    
-    lastResolutionTime = currentTime
-    
-    local resolutionIndex = loadResolutionIndex()
-    local conflicts = findFileConflicts()
-    pruneObsoleteResolutions(conflicts, resolutionIndex)
-    
-    local resolvedCount = 0
-    local skippedCount = 0
-    local totalConflicts = tableSize(conflicts)
-    
-    if totalConflicts == 0 then
-        return {
-            success = true,
-            message = "No conflicts found",
-            resolvedCount = 0,
-            totalConflicts = 0
-        }
-    end
-    
-    for filePath, modsList in pairs(conflicts) do
-        if shouldSkipMerge(filePath, modsList, resolutionIndex) then
-            resolvedConflicts[filePath] = resolutionIndex[filePath]
-            skippedCount = skippedCount + 1
-        else
-            if mergeConflictingFiles(filePath, modsList) then
-                local outputPath = MERGE_OUTPUT_DIR .. filePath
-                if FS:fileExists(outputPath) then
-                    local outputContent = readFile(outputPath)
-                    local outputHash = computeFileHash(outputContent)
-                    recordResolution(filePath, modsList, outputHash, resolutionIndex)
-                    resolvedConflicts[filePath] = resolutionIndex[filePath]
-                end
-                resolvedCount = resolvedCount + 1
-            end
-        end
-    end
-    
+local function finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionIndex)
     saveResolutionIndex(resolutionIndex)
     
     conflictCounts = {
@@ -1822,7 +1873,6 @@ local function resolveConflicts(forceRun)
         end
     end
     
-    -- Close ZIP caches after resolution to free up resources
     if resolvedCount > 0 or skippedCount > 0 then
         closeAllZipCaches()
     end
@@ -1835,6 +1885,62 @@ local function resolveConflicts(forceRun)
         totalConflicts = totalConflicts,
         conflicts = resolvedConflicts
     }
+end
+
+local function processConflicts(conflicts, resolutionIndex)
+    local resolvedCount = 0
+    local skippedCount = 0
+    local totalConflicts = tableSize(conflicts)
+    
+    if totalConflicts == 0 then
+        return {
+            success = true,
+            message = "No conflicts found",
+            resolvedCount = 0,
+            totalConflicts = 0
+        }
+    end
+    
+    for filePath, modsList in pairs(conflicts) do
+        if shouldSkipMerge(filePath, modsList, resolutionIndex) then
+            resolvedConflicts[filePath] = resolutionIndex[filePath]
+            skippedCount = skippedCount + 1
+        else
+            if mergeConflictingFiles(filePath, modsList) then
+                local outputPath = MERGE_OUTPUT_DIR .. filePath
+                if FS:fileExists(outputPath) then
+                    local outputContent = readFile(outputPath)
+                    local outputHash = computeFileHash(outputContent)
+                    recordResolution(filePath, modsList, outputHash, resolutionIndex)
+                    resolvedConflicts[filePath] = resolutionIndex[filePath]
+                end
+                resolvedCount = resolvedCount + 1
+            end
+        end
+    end
+    
+    return finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionIndex)
+end
+
+local function resolveConflicts(forceRun)
+    conflictStartTime = os.time()
+    local currentTime = os.time()
+    if not forceRun and (currentTime - lastResolutionTime) < RESOLUTION_DEBOUNCE_TIME then
+        return {
+            success = false,
+            message = "Skipped due to debounce",
+            resolvedCount = 0,
+            totalConflicts = 0
+        }
+    end
+    
+    lastResolutionTime = currentTime
+    
+    local resolutionIndex = loadResolutionIndex()
+    local conflicts = findFileConflicts()
+    pruneObsoleteResolutions(conflicts, resolutionIndex)
+    
+    return processConflicts(conflicts, resolutionIndex)
 end
 
 local function getConflictStatus()
@@ -1879,32 +1985,26 @@ local function onModDeactivated(modData)
     resolveConflicts()
 end
 
--- Core conflict resolution
 M.resolveConflicts = resolveConflicts
 M.getConflictStatus = getConflictStatus
 M.clearResolvedConflicts = clearResolvedConflicts
 M.findFileConflicts = findFileConflicts
 
--- File system operations
 M.clearMergeOutputDirectory = clearMergeOutputDirectory
 M.mountConflictResolver = mountConflictResolver
 M.unmountConflictResolver = unmountConflictResolver
 
--- Mod management
 M.getActiveMods = getActiveMods
 M.onModActivated = onModActivated
 M.onModDeactivated = onModDeactivated
 
--- Cache management
 M.clearAllCaches = clearAllCaches
 M.getCacheStats = getCacheStats
 
--- Manifest system
 M.manifestIsStale = manifestIsStale
 M.buildManifest = buildManifest
 M.loadManifestList = loadManifestList
 
--- Enhanced JSON processing
 M.detectJsonFormat = detectJsonFormat
 M.parseJsonContent = parseJsonContent
 M.generateUniqueKey = generateUniqueKey
@@ -1912,14 +2012,12 @@ M.mergeJsonLines = mergeJsonLines
 M.mergeSingleJsonObjects = mergeSingleJsonObjects
 M.objectsToJsonFormat = objectsToJsonFormat
 
--- Resolution index management
 M.loadResolutionIndex = loadResolutionIndex
 M.saveResolutionIndex = saveResolutionIndex
 M.pruneObsoleteResolutions = pruneObsoleteResolutions
 M.shouldSkipMerge = shouldSkipMerge
 M.recordResolution = recordResolution
 
--- Performance optimization helpers
 M.quickScanForPotentialConflicts = quickScanForPotentialConflicts
 M.computePartHashesForEntry = computePartHashesForEntry
 M.allPartHashesEqual = allPartHashesEqual
