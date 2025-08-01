@@ -10,6 +10,8 @@ local JSON_DETECTION_SAMPLE_SIZE = 4096
 local resolvedConflicts = {}
 local conflictCounts = {}
 local lastResolutionTime = 0
+local modSnapshot = {}
+local globalFileToMods = {}
 
 local modFileCache = {}
 local zipFileListCache = {}
@@ -141,130 +143,52 @@ local function getZipFileMap(zipPath)
     return zipFileListCache[zipPath]
 end
 
-local function buildManifest(modData, manifestPath, modName)
-    local files = {}
-    local startTime = os.time()
+local function computeFileHash(content)
+    if not content then return "0" end
     
-    if modData.modData and modData.modData.hashes then
-        for _, hashData in ipairs(modData.modData.hashes) do
-            local filePath = normalizePath(hashData[1])
-            if isSupportedFileType(filePath) then
-                table.insert(files, internPath(filePath))
-            end
-        end
-    elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
-        local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
-        for _, fullPath in ipairs(modFiles) do
-            local relativePath = fullPath:gsub(modData.unpackedPath, "")
-            relativePath = normalizePath(relativePath)
-            if isSupportedFileType(relativePath) then
-                table.insert(files, internPath(relativePath))
-            end
+    local hash = 5381
+    for i = 1, #content do
+        hash = ((hash * 33) + string.byte(content, i)) % 2147483647
+    end
+    return tostring(hash)
+end
+
+local function readFileFromMod(filePath, modData, modName, expectedHash)
+    filePath = normalizePath(filePath)
+    
+    if expectedHash and fileContentCache[expectedHash] then
+        return fileContentCache[expectedHash]
+    end
+    
+    local content = nil
+    
+    if modData.unpackedPath then
+        local fullPath = modData.unpackedPath .. filePath
+        if FS:fileExists(fullPath) then
+            content = readFile(fullPath)
         end
     elseif modData.fullpath and FS:fileExists(modData.fullpath) then
         local zipFileMap = getZipFileMap(modData.fullpath)
-        for filePath, _ in pairs(zipFileMap) do
-            local normalized = normalizePath(filePath)
-            if isSupportedFileType(normalized) then
-                table.insert(files, internPath(normalized))
+        local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
+        local fileIndex = zipFileMap[zipEntryPath] or zipFileMap[filePath]
+
+        if fileIndex then
+            local zip = ZipArchive()
+            if zip:openArchiveName(modData.fullpath, "R") then
+                content = zip:readFileEntryByIdx(fileIndex)
+                zip:close()
+            else
+                log('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
             end
         end
     end
     
-    local manifest = {
-        scanned = startTime,
-        count = #files,
-        files = files
-    }
-    
-    if not FS:directoryExists(MANIFEST_DIR) then
-        FS:directoryCreate(MANIFEST_DIR, true)
+    if content then
+        local hash = expectedHash or computeFileHash(content)
+        fileContentCache[hash] = content
     end
     
-    local success = jsonWriteFile(manifestPath, manifest, true)
-    
-    if success then
-        log('I', 'ConflictResolver', 'Built manifest for ' .. (modName or 'unknown') .. ' with ' .. #files .. ' files')
-    else
-        log('E', 'ConflictResolver', 'Failed to write manifest: ' .. manifestPath)
-    end
-    
-    return manifest
-end
-
-local function loadManifestList(modData, modName)
-    if not modData or not modName then
-        return {}
-    end
-    
-    local sanitizedName = sanitizeModName(modName)
-    local manifestPath = MANIFEST_DIR .. sanitizedName .. ".json"
-    
-    if manifestIsStale(modData, manifestPath) then
-        local manifest = buildManifest(modData, manifestPath, modName)
-        return manifest.files or {}
-    else
-        local manifest = jsonReadFile(manifestPath)
-        if manifest and manifest.files then
-            return manifest.files
-        else
-            log('W', 'ConflictResolver', 'Invalid manifest file, rebuilding: ' .. manifestPath)
-            local newManifest = buildManifest(modData, manifestPath, modName)
-            return newManifest.files or {}
-        end
-    end
-end
-
-local function clearModCache(modName)
-    modFileCache[modName] = nil
-    for cacheKey in pairs(fileContentCache) do
-        if cacheKey:startswith(modName .. ":") then
-            fileContentCache[cacheKey] = nil
-        end
-    end
-    
-    if modName then
-        local sanitizedName = sanitizeModName(modName)
-        local manifestPath = MANIFEST_DIR .. sanitizedName .. ".json"
-        if FS:fileExists(manifestPath) then
-            FS:remove(manifestPath)
-        end
-    end
-end
-
-local function clearAllCaches()
-    modFileCache = {}
-    zipFileListCache = {}
-    fileContentCache = {}
-    pathInternCache = {}
-    
-    if FS:directoryExists(MANIFEST_DIR) then
-        local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
-        for _, manifestPath in ipairs(manifestFiles) do
-            FS:remove(manifestPath)
-        end
-    end
-end
-
-local function getCacheStats()
-    local stats = {
-        modFileCache = tableSize(modFileCache),
-        zipFileListCache = tableSize(zipFileListCache),
-        fileContentCache = tableSize(fileContentCache),
-        pathInternCache = tableSize(pathInternCache),
-        totalCacheEntries = 0
-    }
-    stats.totalCacheEntries = stats.modFileCache + stats.zipFileListCache + stats.fileContentCache + stats.pathInternCache
-    
-    if FS:directoryExists(MANIFEST_DIR) then
-        local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
-        stats.manifestFiles = #manifestFiles
-        stats.totalCacheEntries = stats.totalCacheEntries + stats.manifestFiles
-    else
-        stats.manifestFiles = 0
-    end
-    
-    return stats
+    return content
 end
 
 local function batchReadFromZip(zipPath, filePaths)
@@ -297,6 +221,186 @@ local function batchReadFromZip(zipPath, filePaths)
     return results
 end
 
+local function buildManifest(modData, manifestPath, modName)
+    local entries = {}
+    local startTime = os.time()
+    
+    if modData.modData and modData.modData.hashes then
+        for _, hashData in ipairs(modData.modData.hashes) do
+            local filePath = normalizePath(hashData[1])
+            if isSupportedFileType(filePath) then
+                local content = readFileFromMod(filePath, modData, modName)
+                local hash = computeFileHash(content)
+                table.insert(entries, {
+                    path = internPath(filePath),
+                    hash = hash
+                })
+                if content then
+                    fileContentCache[hash] = content
+                end
+            end
+        end
+    elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
+        local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
+        for _, fullPath in ipairs(modFiles) do
+            local relativePath = fullPath:gsub(modData.unpackedPath, "")
+            relativePath = normalizePath(relativePath)
+            if isSupportedFileType(relativePath) then
+                local content = readFile(fullPath)
+                local hash = computeFileHash(content)
+                table.insert(entries, {
+                    path = internPath(relativePath),
+                    hash = hash
+                })
+                if content then
+                    fileContentCache[hash] = content
+                end
+            end
+        end
+    elseif modData.fullpath and FS:fileExists(modData.fullpath) then
+        local zipFileMap = getZipFileMap(modData.fullpath)
+        local zipPaths = {}
+        for filePath, _ in pairs(zipFileMap) do
+            local normalized = normalizePath(filePath)
+            if isSupportedFileType(normalized) then
+                table.insert(zipPaths, normalized)
+            end
+        end
+        
+        local batchContent = batchReadFromZip(modData.fullpath, zipPaths)
+        for filePath, content in pairs(batchContent) do
+            local hash = computeFileHash(content)
+            table.insert(entries, {
+                path = internPath(filePath),
+                hash = hash
+            })
+            if content then
+                fileContentCache[hash] = content
+            end
+        end
+    end
+    
+    local manifest = {
+        scanned = startTime,
+        entries = entries
+    }
+    
+    if not FS:directoryExists(MANIFEST_DIR) then
+        FS:directoryCreate(MANIFEST_DIR, true)
+    end
+    
+    local success = jsonWriteFile(manifestPath, manifest, true)
+    
+    if success then
+        log('I', 'ConflictResolver', 'Built manifest for ' .. (modName or 'unknown') .. ' with ' .. #entries .. ' files')
+    else
+        log('E', 'ConflictResolver', 'Failed to write manifest: ' .. manifestPath)
+    end
+    
+    return manifest
+end
+
+local function loadManifestList(modData, modName)
+    if not modData or not modName then
+        return {}
+    end
+    
+    local sanitizedName = sanitizeModName(modName)
+    local manifestPath = MANIFEST_DIR .. sanitizedName .. ".json"
+    
+    if manifestIsStale(modData, manifestPath) then
+        local manifest = buildManifest(modData, manifestPath, modName)
+        modSnapshot[modName] = {
+            ts = manifest.scanned,
+            entries = manifest.entries
+        }
+        return manifest.entries or {}
+    else
+        local manifest = jsonReadFile(manifestPath)
+        if manifest and manifest.entries then
+            if not modSnapshot[modName] or modSnapshot[modName].ts ~= manifest.scanned then
+                modSnapshot[modName] = {
+                    ts = manifest.scanned,
+                    entries = manifest.entries
+                }
+            end
+            return manifest.entries
+        else
+            log('W', 'ConflictResolver', 'Invalid manifest file, rebuilding: ' .. manifestPath)
+            local newManifest = buildManifest(modData, manifestPath, modName)
+            modSnapshot[modName] = {
+                ts = newManifest.scanned,
+                entries = newManifest.entries
+            }
+            return newManifest.entries or {}
+        end
+    end
+end
+
+local function clearModCache(modName)
+    modFileCache[modName] = nil
+    modSnapshot[modName] = nil
+    
+    for filePath, modsList in pairs(globalFileToMods) do
+        for i = #modsList, 1, -1 do
+            if modsList[i].modName == modName then
+                table.remove(modsList, i)
+            end
+        end
+        if #modsList == 0 then
+            globalFileToMods[filePath] = nil
+        end
+    end
+    
+    if modName then
+        local sanitizedName = sanitizeModName(modName)
+        local manifestPath = MANIFEST_DIR .. sanitizedName .. ".json"
+        if FS:fileExists(manifestPath) then
+            FS:remove(manifestPath)
+        end
+    end
+end
+
+local function clearAllCaches()
+    modFileCache = {}
+    zipFileListCache = {}
+    fileContentCache = {}
+    pathInternCache = {}
+    modSnapshot = {}
+    globalFileToMods = {}
+    
+    if FS:directoryExists(MANIFEST_DIR) then
+        local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
+        for _, manifestPath in ipairs(manifestFiles) do
+            FS:remove(manifestPath)
+        end
+    end
+end
+
+local function getCacheStats()
+    local stats = {
+        modFileCache = tableSize(modFileCache),
+        zipFileListCache = tableSize(zipFileListCache),
+        fileContentCache = tableSize(fileContentCache),
+        pathInternCache = tableSize(pathInternCache),
+        modSnapshot = tableSize(modSnapshot),
+        globalFileToMods = tableSize(globalFileToMods),
+        totalCacheEntries = 0
+    }
+    stats.totalCacheEntries = stats.modFileCache + stats.zipFileListCache + stats.fileContentCache + 
+                              stats.pathInternCache + stats.modSnapshot + stats.globalFileToMods
+    
+    if FS:directoryExists(MANIFEST_DIR) then
+        local manifestFiles = FS:findFiles(MANIFEST_DIR, '*.json', 0, true, false)
+        stats.manifestFiles = #manifestFiles
+        stats.totalCacheEntries = stats.totalCacheEntries + stats.manifestFiles
+    else
+        stats.manifestFiles = 0
+    end
+    
+    return stats
+end
+
 local function getActiveMods()    
     local activeMods = {}
     local allMods = core_modmanager.getMods()
@@ -323,13 +427,13 @@ local function getModFiles(modData, modName)
         return modFileCache[modName]
     end
     
-    local files = loadManifestList(modData, modName)
+    local entries = loadManifestList(modData, modName)
     
     if modName then
-        modFileCache[modName] = files
+        modFileCache[modName] = entries
     end
     
-    return files
+    return entries
 end
 
 local function fileExistsInMod(filePath, modData)
@@ -344,44 +448,6 @@ local function fileExistsInMod(filePath, modData)
         return zipFileMap[zipEntryPath] ~= nil or zipFileMap[filePath] ~= nil
     end
     return false
-end
-
-local function readFileFromMod(filePath, modData, modName)
-    filePath = normalizePath(filePath)
-    
-    local cacheKey = (modName or "unknown") .. ":" .. filePath
-    if fileContentCache[cacheKey] then
-        return fileContentCache[cacheKey]
-    end
-    
-    local content = nil
-    
-    if modData.unpackedPath then
-        local fullPath = modData.unpackedPath .. filePath
-        if FS:fileExists(fullPath) then
-            content = readFile(fullPath)
-        end
-    elseif modData.fullpath and FS:fileExists(modData.fullpath) then
-        local zipFileMap = getZipFileMap(modData.fullpath)
-        local zipEntryPath = filePath:startswith("/") and filePath:sub(2) or filePath
-        local fileIndex = zipFileMap[zipEntryPath] or zipFileMap[filePath]
-
-        if fileIndex then
-            local zip = ZipArchive()
-            if zip:openArchiveName(modData.fullpath, "R") then
-                content = zip:readFileEntryByIdx(fileIndex)
-                zip:close()
-            else
-                log('E', 'ConflictResolver', 'Failed to open ZIP: ' .. modData.fullpath)
-            end
-        end
-    end
-    
-    if content then
-        fileContentCache[cacheKey] = content
-    end
-    
-    return content
 end
 
 local function mountConflictResolver()
@@ -930,35 +996,159 @@ local function mergeJson(base, overlay)
     return result
 end
 
-local function findFileConflicts()
-    local activeMods = getActiveMods()
-    local fileToMods = {}
-    local conflicts = {}
+local function allHashesEqual(modsList)
+    if #modsList <= 1 then return true end
     
-    for modName, modData in pairs(activeMods) do
-        local modFiles = getModFiles(modData, modName)
-        for _, filePath in ipairs(modFiles) do
-            local internedPath = internPath(filePath)
-            if not fileToMods[internedPath] then
-                fileToMods[internedPath] = {}
+    local firstHash = modsList[1].hash
+    for i = 2, #modsList do
+        if modsList[i].hash ~= firstHash then
+            return false
+        end
+    end
+    return true
+end
+
+local function copyFirstFileAndRecord(filePath, modsList)
+    local firstMod = modsList[1]
+    local content = readFileFromMod(filePath, firstMod.modData, firstMod.modName, firstMod.hash)
+    
+    if not content then
+        return false
+    end
+    
+    local outputPath = MERGE_OUTPUT_DIR .. filePath
+    local outputDir = outputPath:match("(.+)/[^/]+$")
+    
+    if outputDir and not FS:directoryExists(outputDir) then
+        FS:directoryCreate(outputDir, true)
+    end
+    
+    local success = writeFile(outputPath, content)
+    
+    if success then
+        local sourceMods = {}
+        for _, modInfo in ipairs(modsList) do
+            table.insert(sourceMods, modInfo.modName)
+        end
+        
+        resolvedConflicts[filePath] = {
+            outputPath = outputPath,
+            sourceMods = sourceMods,
+            mergedAt = os.time(),
+            identicalHash = firstMod.hash
+        }
+        return true
+    end
+    
+    return false
+end
+
+local function updateGlobalFileToMods(modName, entries)
+    for _, entry in ipairs(entries) do
+        local filePath = entry.path
+        if not globalFileToMods[filePath] then
+            globalFileToMods[filePath] = {}
+        end
+        
+        local found = false
+        for i, existing in ipairs(globalFileToMods[filePath]) do
+            if existing.modName == modName then
+                globalFileToMods[filePath][i] = {
+                    modName = modName,
+                    modData = existing.modData,
+                    hash = entry.hash
+                }
+                found = true
+                break
             end
-            table.insert(fileToMods[internedPath], {
+        end
+        
+        if not found then
+            table.insert(globalFileToMods[filePath], {
                 modName = modName,
-                modData = modData
+                modData = nil,
+                hash = entry.hash
             })
         end
     end
+end
+
+local function findFileConflicts()
+    local activeMods = getActiveMods()
+    local conflicts = {}
     
-    for filePath, modsList in pairs(fileToMods) do
-        if #modsList > 1 then
-            conflicts[filePath] = modsList
+    for modName, modData in pairs(activeMods) do
+        local currentSnapshot = modSnapshot[modName]
+        if not currentSnapshot then
+            local entries = getModFiles(modData, modName)
+            updateGlobalFileToMods(modName, entries)
+        else
+            local manifestPath = MANIFEST_DIR .. sanitizeModName(modName) .. ".json"
+            if manifestIsStale(modData, manifestPath) then
+                local entries = getModFiles(modData, modName)
+                updateGlobalFileToMods(modName, entries)
+            end
+        end
+        
+        for filePath, modsList in pairs(globalFileToMods) do
+            for _, modInfo in ipairs(modsList) do
+                if modInfo.modName == modName then
+                    modInfo.modData = modData
+                    break
+                end
+            end
+        end
+    end
+    
+    for filePath, modsList in pairs(globalFileToMods) do
+        local activeModsList = {}
+        for _, modInfo in ipairs(modsList) do
+            if modInfo.modData and activeMods[modInfo.modName] then
+                table.insert(activeModsList, modInfo)
+            end
+        end
+        
+        if #activeModsList > 1 then
+            conflicts[filePath] = activeModsList
         end
     end
     
     return conflicts
 end
 
+local function batchReadUnpackedMods(unpackedMods, filePath)
+    local fileGroups = {}
+    local results = {}
+    
+    for _, modInfo in ipairs(unpackedMods) do
+        if modInfo.modData.unpackedPath then
+            local fullPath = modInfo.modData.unpackedPath .. filePath
+            if not fileGroups[fullPath] then
+                fileGroups[fullPath] = {}
+            end
+            table.insert(fileGroups[fullPath], modInfo)
+        end
+    end
+    
+    for fullPath, mods in pairs(fileGroups) do
+        if FS:fileExists(fullPath) then
+            local content = readFile(fullPath)
+            if content then
+                for _, modInfo in ipairs(mods) do
+                    results[modInfo.modName] = content
+                end
+            end
+        end
+    end
+    
+    return results
+end
+
 local function mergeConflictingFiles(filePath, modsList)
+    if allHashesEqual(modsList) then
+        return copyFirstFileAndRecord(filePath, modsList)
+    end
+    
     local isLuaFile = filePath:lower():endswith('.lua')
 
     local lowerPath = filePath:lower()
@@ -1022,7 +1212,7 @@ local function mergeConflictingFiles(filePath, modsList)
     
     for zipPath, zipMods in pairs(zipGroups) do
         local modInfo = zipMods[1]
-        local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName)
+        local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName, modInfo.hash)
 
         if fileContent then
             for _, mod in ipairs(zipMods) do
@@ -1031,11 +1221,9 @@ local function mergeConflictingFiles(filePath, modsList)
         end
     end
     
-    for _, modInfo in ipairs(unpackedMods) do
-        local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName)
-        if fileContent then
-            processContent(fileContent, modInfo.modName)
-        end
+    local unpackedContent = batchReadUnpackedMods(unpackedMods, filePath)
+    for modName, content in pairs(unpackedContent) do
+        processContent(content, modName)
     end
     
     if isJsonFile and #allObjects > 0 then
