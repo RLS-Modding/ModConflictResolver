@@ -921,91 +921,109 @@ local function generateUniqueKey(obj)
         return obj.__key
     end
     
-    local idKeys = {"persistentId", "id", "uuid", "guid"}
-    local nameKeys = {"name", "title", "label"}
+    local nameKeys = {"name", "title", "label", "id", "guid", "uuid"}
     local positionKeys = {"position", "pos", "location", "transform"}
     local rotationKeys = {"rotationMatrix", "rotation", "rot", "orientation"}
     local typeKeys = {"type", "class", "category", "kind"}
     local parentKeys = {"__parent", "parent", "parentId"}
+    local shapeKeys = {"shapeName", "shape", "mesh", "model"}
+    local annotationKeys = {"annotation", "description", "comment"}
+    local additionalKeys = {"material", "texture", "scale", "size", "isRenderEnabled", "useInstanceRenderData", "decalType"}
     
     local keyParts = {}
-    
-    local foundId = nil
-    for _, key in ipairs(idKeys) do
-        if obj[key] then
-            foundId = tostring(obj[key])
-            break
-        end
-    end
-    
-    local foundName = nil
+        
     for _, key in ipairs(nameKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, "name:" .. tostring(obj[key]))
+        end
+    end
+    
+    for _, key in ipairs(typeKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, "type:" .. tostring(obj[key]))
+        end
+    end
+    
+    for _, key in ipairs(parentKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, "parent:" .. tostring(obj[key]))
+        end
+    end
+    
+    for _, key in ipairs(shapeKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, "shape:" .. tostring(obj[key]))
+        end
+    end
+    
+    for _, key in ipairs(annotationKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, "annotation:" .. tostring(obj[key]))
+        end
+    end
+    
+    for _, key in ipairs(positionKeys) do
         if obj[key] then
-            foundName = tostring(obj[key])
-            break
-        end
-    end
-    
-    if foundId and foundName then
-        table.insert(keyParts, foundId .. ":" .. foundName)
-    elseif foundId then
-        table.insert(keyParts, foundId)
-    elseif foundName then
-        table.insert(keyParts, foundName)
-    end
-    
-    if #keyParts == 0 then
-        for _, key in ipairs(typeKeys) do
-            if obj[key] then
-                table.insert(keyParts, tostring(obj[key]))
-                break
-            end
-        end
-        
-        for _, key in ipairs(parentKeys) do
-            if obj[key] then
-                table.insert(keyParts, tostring(obj[key]))
-                break
-            end
-        end
-        
-        for _, key in ipairs(positionKeys) do
-            if obj[key] and type(obj[key]) == "table" then
+            if type(obj[key]) == "table" then
                 local pos = obj[key]
-                local posStr = string.format("%.6f,%.6f,%.6f", 
+                local posStr = string.format("pos:%.6f,%.6f,%.6f", 
                     pos[1] or pos.x or 0, 
                     pos[2] or pos.y or 0, 
                     pos[3] or pos.z or 0)
                 table.insert(keyParts, posStr)
-                break
+            else
+                table.insert(keyParts, "pos:" .. tostring(obj[key]))
             end
         end
-        
-        for _, key in ipairs(rotationKeys) do
-            if obj[key] then
-                if type(obj[key]) == "table" then
-                    local rot = obj[key]
-                    if #rot >= 3 then
-                        local rotStr = string.format("%.3f,%.3f,%.3f", rot[1] or 0, rot[2] or 0, rot[3] or 0)
-                        table.insert(keyParts, rotStr)
-                    end
-                else
-                    table.insert(keyParts, tostring(obj[key]))
+    end
+    
+    for _, key in ipairs(rotationKeys) do
+        if obj[key] then
+            if type(obj[key]) == "table" then
+                local rot = obj[key]
+                if #rot >= 9 then
+                    local rotStr = string.format("rot:%.6f,%.6f,%.6f,%.6f,%.6f,%.6f", 
+                        rot[1] or 0, rot[2] or 0, rot[3] or 0, 
+                        rot[4] or 0, rot[5] or 0, rot[6] or 0)
+                    table.insert(keyParts, rotStr)
+                elseif #rot >= 3 then
+                    local rotStr = string.format("rot:%.6f,%.6f,%.6f", rot[1] or 0, rot[2] or 0, rot[3] or 0)
+                    table.insert(keyParts, rotStr)
                 end
-                break
+            else
+                table.insert(keyParts, "rot:" .. tostring(obj[key]))
             end
         end
-        
-        if obj.shapeName then
-            table.insert(keyParts, tostring(obj.shapeName))
+    end
+    
+    for _, key in ipairs(additionalKeys) do
+        if obj[key] and obj[key] ~= "" then
+            table.insert(keyParts, key .. ":" .. tostring(obj[key]))
+        end
+    end
+    
+    if #keyParts < 3 then
+        local otherKeys = {"value", "data", "content", "color", "variant", "model"}
+        for _, key in ipairs(otherKeys) do
+            if obj[key] and obj[key] ~= "" then
+                table.insert(keyParts, key .. ":" .. tostring(obj[key]))
+            end
         end
     end
     
     local key
     if #keyParts == 0 then
-        key = jsonEncode(obj)
+        local sortedPairs = {}
+        for k, v in pairs(obj) do
+            if k ~= "__key" then
+                table.insert(sortedPairs, k .. "=" .. tostring(v))
+            end
+        end
+        table.sort(sortedPairs)
+        key = "hash:" .. table.concat(sortedPairs, ";")
     else
-        key = table.concat(keyParts, ":")
+        table.sort(keyParts)
+        key = table.concat(keyParts, "|")
     end
     
     obj.__key = key
@@ -1060,10 +1078,6 @@ local function allPartHashesEqual(modsList, filePath)
 end
 
 local function mergeJsonLines(allObjects, filePath, modsList)
-    if modsList and allPartHashesEqual(modsList, filePath) then
-        return allObjects
-    end
-    
     local mergedObjects = {}
     local seenObjects = {}
     
@@ -1704,9 +1718,13 @@ local function mergeConflictingFiles(filePath, modsList)
         return copyFirstFileAndRecord(filePath, modsList)
     end
     
-    local isLuaFile = filePath:lower():endswith('.lua')
-
+    if allPartHashesEqual(modsList, filePath) then
+        return copyFirstFileAndRecord(filePath, modsList)
+    end
+    
     local lowerPath = filePath:lower()
+    
+    local isLuaFile = filePath:lower():endswith('.lua')
     local isJsonFile = lowerPath:endswith('.json') or lowerPath:endswith('.forest4') or 
                       lowerPath:endswith('.level') or lowerPath:endswith('.prefab') or 
                       lowerPath:endswith('.jbeam') or lowerPath:endswith('.jsonl')
@@ -1770,9 +1788,12 @@ local function mergeConflictingFiles(filePath, modsList)
         local fileContent = readFileFromMod(filePath, modInfo.modData, modInfo.modName, modInfo.hash)
 
         if fileContent then
+            -- Only process the content once per zip file, use combined mod name
+            local combinedModName = {}
             for _, mod in ipairs(zipMods) do
-                processContent(fileContent, mod.modName)
+                table.insert(combinedModName, mod.modName)
             end
+            processContent(fileContent, table.concat(combinedModName, "+"))
         end
     end
     
