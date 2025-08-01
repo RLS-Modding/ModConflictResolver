@@ -6,6 +6,7 @@ local RESOLVER_MOUNT_POINT = "/mods/ModConflictResolutions/"
 local RESOLUTION_DEBOUNCE_TIME = 2.0
 local MANIFEST_DIR = "/mods/mod_manifests/"
 local JSON_DETECTION_SAMPLE_SIZE = 4096
+local RESOLUTION_INDEX_FILE = MERGE_OUTPUT_DIR .. "resolutions.json"
 
 local resolvedConflicts = {}
 local conflictCounts = {}
@@ -113,13 +114,14 @@ local function manifestIsStale(modData, manifestPath)
     if not FS:fileExists(manifestPath) then
         return true
     end
-    local manifestStat = FS:stat(manifestPath)
-    if not manifestStat or not manifestStat.modtime then
+    
+    local manifest = jsonReadFile(manifestPath)
+    if not manifest or not manifest.latest then
         return true
     end
     
     local modTimestamp = getModTimestamp(modData)
-    return modTimestamp > manifestStat.modtime
+    return modTimestamp > manifest.latest
 end
 
 local function getZipFileMap(zipPath)
@@ -224,6 +226,7 @@ end
 local function buildManifest(modData, manifestPath, modName)
     local entries = {}
     local startTime = os.time()
+    local latestMtime = 0
     
     if modData.modData and modData.modData.hashes then
         for _, hashData in ipairs(modData.modData.hashes) do
@@ -240,6 +243,7 @@ local function buildManifest(modData, manifestPath, modName)
                 end
             end
         end
+        latestMtime = getModTimestamp(modData)
     elseif modData.unpackedPath and FS:directoryExists(modData.unpackedPath) then
         local modFiles = FS:findFiles(modData.unpackedPath, '*', -1, true, false)
         for _, fullPath in ipairs(modFiles) do
@@ -254,6 +258,11 @@ local function buildManifest(modData, manifestPath, modName)
                 })
                 if content then
                     fileContentCache[hash] = content
+                end
+                
+                local stat = FS:stat(fullPath)
+                if stat and stat.modtime and stat.modtime > latestMtime then
+                    latestMtime = stat.modtime
                 end
             end
         end
@@ -278,10 +287,12 @@ local function buildManifest(modData, manifestPath, modName)
                 fileContentCache[hash] = content
             end
         end
+        latestMtime = getModTimestamp(modData)
     end
     
     local manifest = {
         scanned = startTime,
+        latest = latestMtime,
         entries = entries
     }
     
@@ -481,6 +492,110 @@ local function clearMergeOutputDirectory()
     if FS:directoryExists(MERGE_OUTPUT_DIR) then
         FS:remove(MERGE_OUTPUT_DIR)
     end
+end
+
+local function loadResolutionIndex()
+    if not FS:fileExists(RESOLUTION_INDEX_FILE) then
+        return {}
+    end
+    
+    local index = jsonReadFile(RESOLUTION_INDEX_FILE)
+    if not index or type(index) ~= "table" then
+        return {}
+    end
+    
+    return index
+end
+
+local function saveResolutionIndex(index)
+    if not FS:directoryExists(MERGE_OUTPUT_DIR) then
+        FS:directoryCreate(MERGE_OUTPUT_DIR, true)
+    end
+    
+    jsonWriteFile(RESOLUTION_INDEX_FILE, index, true)
+end
+
+local function pruneObsoleteResolutions(conflicts, index)
+    local activeFiles = {}
+    for filePath, _ in pairs(conflicts) do
+        activeFiles[filePath] = true
+    end
+    
+    for filePath, resolution in pairs(index) do
+        if not activeFiles[filePath] then
+            if resolution.outputPath and FS:fileExists(resolution.outputPath) then
+                FS:remove(resolution.outputPath)
+            end
+            index[filePath] = nil
+        end
+    end
+end
+
+local function shouldSkipMerge(filePath, modsList, index)
+    local resolution = index[filePath]
+    if not resolution then
+        return false
+    end
+    
+    if not resolution.outputPath or not FS:fileExists(resolution.outputPath) then
+        return false
+    end
+    
+    if not resolution.sourceMods or not resolution.sourceHashes then
+        return false
+    end
+    
+    if #resolution.sourceMods ~= #modsList or #resolution.sourceHashes ~= #modsList then
+        return false
+    end
+    
+    local currentMods = {}
+    local currentHashes = {}
+    
+    for _, modInfo in ipairs(modsList) do
+        table.insert(currentMods, modInfo.modName)
+        table.insert(currentHashes, modInfo.hash)
+    end
+    
+    table.sort(currentMods)
+    table.sort(currentHashes)
+    
+    local cachedMods = {}
+    local cachedHashes = {}
+    for _, mod in ipairs(resolution.sourceMods) do
+        table.insert(cachedMods, mod)
+    end
+    for _, hash in ipairs(resolution.sourceHashes) do
+        table.insert(cachedHashes, hash)
+    end
+    table.sort(cachedMods)
+    table.sort(cachedHashes)
+    
+    for i = 1, #currentMods do
+        if currentMods[i] ~= cachedMods[i] or currentHashes[i] ~= cachedHashes[i] then
+            return false
+        end
+    end
+    
+    return true
+end
+
+local function recordResolution(filePath, modsList, outputHash, index)
+    local sourceMods = {}
+    local sourceHashes = {}
+    
+    for _, modInfo in ipairs(modsList) do
+        table.insert(sourceMods, modInfo.modName)
+        table.insert(sourceHashes, modInfo.hash)
+    end
+    
+    index[filePath] = {
+        outputPath = MERGE_OUTPUT_DIR .. filePath,
+        sourceMods = sourceMods,
+        sourceHashes = sourceHashes,
+        outputHash = outputHash,
+        mergedAt = os.time()
+    }
 end
 
 local function detectJsonFormat(content, filePath)
@@ -1294,10 +1409,12 @@ local function resolveConflicts(forceRun)
     
     lastResolutionTime = currentTime
     
-    clearMergeOutputDirectory()
-    
+    local resolutionIndex = loadResolutionIndex()
     local conflicts = findFileConflicts()
+    pruneObsoleteResolutions(conflicts, resolutionIndex)
+    
     local resolvedCount = 0
+    local skippedCount = 0
     local totalConflicts = tableSize(conflicts)
     
     if totalConflicts == 0 then
@@ -1310,22 +1427,38 @@ local function resolveConflicts(forceRun)
     end
     
     for filePath, modsList in pairs(conflicts) do
-        if mergeConflictingFiles(filePath, modsList) then
-            resolvedCount = resolvedCount + 1
+        if shouldSkipMerge(filePath, modsList, resolutionIndex) then
+            resolvedConflicts[filePath] = resolutionIndex[filePath]
+            skippedCount = skippedCount + 1
+        else
+            if mergeConflictingFiles(filePath, modsList) then
+                local outputPath = MERGE_OUTPUT_DIR .. filePath
+                if FS:fileExists(outputPath) then
+                    local outputContent = readFile(outputPath)
+                    local outputHash = computeFileHash(outputContent)
+                    recordResolution(filePath, modsList, outputHash, resolutionIndex)
+                    resolvedConflicts[filePath] = resolutionIndex[filePath]
+                end
+                resolvedCount = resolvedCount + 1
+            end
         end
     end
+    
+    saveResolutionIndex(resolutionIndex)
     
     conflictCounts = {
         total = totalConflicts,
         resolved = resolvedCount,
-        failed = totalConflicts - resolvedCount,
+        skipped = skippedCount,
+        failed = totalConflicts - resolvedCount - skippedCount,
         lastRun = os.time()
     }
     
-    local message = string.format("Resolved %d/%d conflicts", resolvedCount, totalConflicts)
+    local message = string.format("Resolved %d/%d conflicts (%d skipped)", 
+                                  resolvedCount, totalConflicts, skippedCount)
     log('I', 'ConflictResolver', message)
     
-    if resolvedCount > 0 then
+    if resolvedCount > 0 or skippedCount > 0 then
         if mountConflictResolver() then
             local changedFiles = {}
             for filePath, conflictInfo in pairs(resolvedConflicts) do
@@ -1343,9 +1476,10 @@ local function resolveConflicts(forceRun)
     end
     
     return {
-        success = resolvedCount > 0,
+        success = resolvedCount > 0 or skippedCount > 0,
         message = message,
         resolvedCount = resolvedCount,
+        skippedCount = skippedCount,
         totalConflicts = totalConflicts,
         conflicts = resolvedConflicts
     }
@@ -1366,6 +1500,10 @@ local function clearResolvedConflicts()
     conflictCounts = {}
     
     clearAllCaches()
+    
+    if FS:fileExists(RESOLUTION_INDEX_FILE) then
+        FS:remove(RESOLUTION_INDEX_FILE)
+    end
     
     if FS:directoryExists(RESOLVER_MOUNT_POINT) then
         FS:remove(RESOLVER_MOUNT_POINT)
@@ -1420,5 +1558,12 @@ M.generateUniqueKey = generateUniqueKey
 M.mergeJsonLines = mergeJsonLines
 M.mergeSingleJsonObjects = mergeSingleJsonObjects
 M.objectsToJsonFormat = objectsToJsonFormat
+
+-- Resolution index management
+M.loadResolutionIndex = loadResolutionIndex
+M.saveResolutionIndex = saveResolutionIndex
+M.pruneObsoleteResolutions = pruneObsoleteResolutions
+M.shouldSkipMerge = shouldSkipMerge
+M.recordResolution = recordResolution
 
 return M
