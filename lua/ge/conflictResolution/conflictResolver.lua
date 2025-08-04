@@ -7,6 +7,7 @@ local RESOLUTION_DEBOUNCE_TIME = 2.0
 local MANIFEST_DIR = "/mods/mod_manifests/"
 local JSON_DETECTION_SAMPLE_SIZE = 4096
 local RESOLUTION_INDEX_FILE = MERGE_OUTPUT_DIR .. "resolutions.json"
+local RESOLUTION_INDEX_VERSION = "0.1"
 
 local resolvedConflicts = {}
 local conflictCounts = {}
@@ -779,43 +780,90 @@ end
 
 local function loadResolutionIndex()
     if not FS:fileExists(RESOLUTION_INDEX_FILE) then
-        return {}
+        return { version = RESOLUTION_INDEX_VERSION, resolutions = {}, versionChanged = false }
     end
     
-    local index = jsonReadFile(RESOLUTION_INDEX_FILE)
-    if not index or type(index) ~= "table" then
-        return {}
+    local data = jsonReadFile(RESOLUTION_INDEX_FILE)
+    if not data or type(data) ~= "table" then
+        return { version = RESOLUTION_INDEX_VERSION, resolutions = {}, versionChanged = false }
     end
     
-    return index
+    -- Check for legacy format (direct resolution data without version)
+    if not data.version and not data.resolutions then
+        log('I', 'ConflictResolver', 'Converting legacy resolution index format - forcing complete rebuild')
+        
+        -- Clear everything for legacy conversion
+        if FS:directoryExists(MERGE_OUTPUT_DIR) then
+            FS:remove(MERGE_OUTPUT_DIR)
+            log('I', 'ConflictResolver', 'Cleared merge output directory for legacy conversion')
+        end
+        
+        return { version = RESOLUTION_INDEX_VERSION, resolutions = {}, versionChanged = true }
+    end
+    
+    -- Check version compatibility
+    if data.version ~= RESOLUTION_INDEX_VERSION then
+        log('I', 'ConflictResolver', string.format('Resolution index version mismatch (%s vs %s), forcing complete rebuild', 
+            tostring(data.version), RESOLUTION_INDEX_VERSION))
+        
+        -- Clear the entire merge output directory for clean start
+        if FS:directoryExists(MERGE_OUTPUT_DIR) then
+            FS:remove(MERGE_OUTPUT_DIR)
+            log('I', 'ConflictResolver', 'Cleared merge output directory due to version change')
+        end
+        
+        -- Clear all caches to ensure fresh start
+        clearAllCaches()
+        
+        return { version = RESOLUTION_INDEX_VERSION, resolutions = {}, versionChanged = true }
+    end
+    
+    -- Same version, no rebuild needed
+    data.versionChanged = false
+    return data
 end
 
-local function saveResolutionIndex(index)
+local function saveResolutionIndex(resolutionData)
     if not FS:directoryExists(MERGE_OUTPUT_DIR) then
         FS:directoryCreate(MERGE_OUTPUT_DIR, true)
     end
     
-    jsonWriteFile(RESOLUTION_INDEX_FILE, index, true)
+    local indexData = {
+        version = RESOLUTION_INDEX_VERSION,
+        createdAt = os.time(),
+        description = "Mod conflict resolution index - tracks merged files and their source mods",
+        resolutions = resolutionData
+    }
+    
+    jsonWriteFile(RESOLUTION_INDEX_FILE, indexData, true)
 end
 
-local function pruneObsoleteResolutions(conflicts, index)
+local function pruneObsoleteResolutions(conflicts, indexData)
     local activeFiles = {}
     for filePath, _ in pairs(conflicts) do
         activeFiles[filePath] = true
     end
     
-    for filePath, resolution in pairs(index) do
+    local resolutions = indexData.resolutions or {}
+    for filePath, resolution in pairs(resolutions) do
         if not activeFiles[filePath] then
             if resolution.outputPath and FS:fileExists(resolution.outputPath) then
                 FS:remove(resolution.outputPath)
             end
-            index[filePath] = nil
+            resolutions[filePath] = nil
         end
     end
+    indexData.resolutions = resolutions
 end
 
-local function shouldSkipMerge(filePath, modsList, index)
-    local resolution = index[filePath]
+local function shouldSkipMerge(filePath, modsList, indexData)
+    -- Never skip if version changed - force complete rebuild
+    if indexData.versionChanged then
+        return false
+    end
+    
+    local resolutions = indexData.resolutions or {}
+    local resolution = resolutions[filePath]
     if not resolution then
         return false
     end
@@ -863,7 +911,7 @@ local function shouldSkipMerge(filePath, modsList, index)
     return true
 end
 
-local function recordResolution(filePath, modsList, outputHash, index)
+local function recordResolution(filePath, modsList, outputHash, indexData)
     local sourceMods = {}
     local sourceHashes = {}
     
@@ -872,7 +920,11 @@ local function recordResolution(filePath, modsList, outputHash, index)
         table.insert(sourceHashes, modInfo.hash)
     end
     
-    index[filePath] = {
+    if not indexData.resolutions then
+        indexData.resolutions = {}
+    end
+    
+    indexData.resolutions[filePath] = {
         outputPath = MERGE_OUTPUT_DIR .. filePath,
         sourceMods = sourceMods,
         sourceHashes = sourceHashes,
@@ -881,10 +933,29 @@ local function recordResolution(filePath, modsList, outputHash, index)
     }
 end
 
+local function stripBOM(text)
+    if not text then return text end
+    
+    -- Remove BOM (U+FEFF) and other invisible Unicode characters
+    text = text:gsub("\239\187\191", "")  -- UTF-8 BOM
+    text = text:gsub("\255\254", "")      -- UTF-16 LE BOM
+    text = text:gsub("\254\255", "")      -- UTF-16 BE BOM
+    text = text:gsub("\239\191\191", "")  -- Alternative UTF-8 BOM representation
+    text = text:gsub("[\194\195][\128-\191]", function(match)
+        -- Remove U+FEFF (Zero Width No-Break Space) in UTF-8
+        if match == "\239\187\191" then return "" end
+        return match
+    end)
+    
+    return text
+end
+
 local function parseJsonContent(content, filePath, modName)
     if not content or content == "" then
         return {}
     end
+    
+    content = stripBOM(content)
     
     local contentHash = computeFileHash(content)
     if fileAstCache[contentHash] then
@@ -1198,23 +1269,13 @@ local function objectsToJsonFormat(objects, filePath, isJsonLines)
         return table.concat(lines, "\n") .. "\n"
     else
         if #objects == 1 then
-            local success, jsonStr = pcall(jsonEncode, objects[1])
-            if success then
-                return jsonStr
-            else
-                return ""
-            end
+            return objects[1]
         else
             local mergedObject = objects[1]
             for i = 2, #objects do
                 mergedObject = mergeSingleJsonObjects(mergedObject, objects[i], filePath)
             end
-            local success, jsonStr = pcall(jsonEncode, mergedObject)
-            if success then
-                return jsonStr
-            else
-                return ""
-            end
+            return mergedObject
         end
     end
 end
@@ -1251,6 +1312,8 @@ local function mergeArrays(baseArray, overlayArray, arrayKey)
 end
 
 local function parseLuaFile(content)
+    content = stripBOM(content)
+    
     local structure = {
         header = "",
         functions = {},
@@ -1261,6 +1324,7 @@ local function parseLuaFile(content)
     
     local lines = {}
     for line in content:gmatch("[^\r\n]+") do
+        line = stripBOM(line)
         table.insert(lines, line)
     end
     
@@ -1737,6 +1801,7 @@ local function mergeConflictingFiles(filePath, modsList)
         table.insert(sourceMods, modName)
 
         if isLuaFile then
+            content = stripBOM(content)
             local luaStructure = parseLuaFile(content)
             if mergedData == nil then
                 mergedData = luaStructure
@@ -1744,6 +1809,7 @@ local function mergeConflictingFiles(filePath, modsList)
                 mergedData = mergeLua(mergedData, luaStructure)
             end
         elseif isJsonFile then
+            content = stripBOM(content)
             local objects = parseJsonContent(content, filePath, modName)
             if #objects > 0 then
                 if not isJsonLines and #allObjects == 0 then
@@ -1755,6 +1821,7 @@ local function mergeConflictingFiles(filePath, modsList)
                 end
             end
         else
+            content = stripBOM(content)
             local success, jsonData = pcall(jsonDecode, content)
             if success then
                 if mergedData == nil then
@@ -1809,15 +1876,13 @@ local function mergeConflictingFiles(filePath, modsList)
             mergedData = jsonContent
         else
             if #allObjects == 1 then
-                local jsonContent = objectsToJsonFormat(allObjects, filePath, false)
-                mergedData = jsonContent
+                mergedData = objectsToJsonFormat(allObjects, filePath, false)
             else
                 local mergedObject = allObjects[1]
                 for i = 2, #allObjects do
                     mergedObject = mergeSingleJsonObjects(mergedObject, allObjects[i], filePath)
                 end
-                local jsonContent = objectsToJsonFormat({mergedObject}, filePath, false)
-                mergedData = jsonContent
+                mergedData = objectsToJsonFormat({mergedObject}, filePath, false)
             end
         end
     end
@@ -1839,7 +1904,11 @@ local function mergeConflictingFiles(filePath, modsList)
         local luaContent = generateLuaContent(mergedData)
         success = writeFile(outputPath, luaContent)
     elseif isJsonFile then
-        success = writeFile(outputPath, mergedData)
+        if isJsonLines then
+            success = writeFile(outputPath, mergedData)
+        else
+            success = jsonWriteFile(outputPath, mergedData, true)
+        end
     else
         success = jsonWriteFile(outputPath, mergedData, true)
     end
@@ -1857,19 +1926,23 @@ local function mergeConflictingFiles(filePath, modsList)
     end
 end
 
-local function finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionIndex)
-    saveResolutionIndex(resolutionIndex)
+local function finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionData, versionChanged)
+    saveResolutionIndex(resolutionData)
     
     conflictCounts = {
         total = totalConflicts,
         resolved = resolvedCount,
         skipped = skippedCount,
         failed = totalConflicts - resolvedCount - skippedCount,
-        lastRun = os.time()
+        lastRun = os.time(),
+        versionChanged = versionChanged or false
     }
     
     local message = string.format("Resolved %d/%d conflicts (%d skipped)", 
                                   resolvedCount, totalConflicts, skippedCount)
+    if versionChanged then
+        message = message .. " [Version changed - complete rebuild]"
+    end
     log('I', 'ConflictResolver', message)
 
     local duration = os.time() - conflictStartTime
@@ -1913,10 +1986,19 @@ local function processConflicts(conflicts, resolutionIndex)
     local skippedCount = 0
     local totalConflicts = tableSize(conflicts)
     
+    -- Log version change status
+    if resolutionIndex.versionChanged then
+        log('I', 'ConflictResolver', 'Version changed - forcing complete rebuild of all resolutions')
+        resolvedConflicts = {}  -- Clear the resolved conflicts cache
+    end
+    
+    -- Always save the resolution index, even if no conflicts
     if totalConflicts == 0 then
+        saveResolutionIndex(resolutionIndex.resolutions or {})
+        local message = resolutionIndex.versionChanged and "No conflicts found (version changed)" or "No conflicts found"
         return {
             success = true,
-            message = "No conflicts found",
+            message = message,
             resolvedCount = 0,
             totalConflicts = 0
         }
@@ -1924,23 +2006,30 @@ local function processConflicts(conflicts, resolutionIndex)
     
     for filePath, modsList in pairs(conflicts) do
         if shouldSkipMerge(filePath, modsList, resolutionIndex) then
-            resolvedConflicts[filePath] = resolutionIndex[filePath]
+            local resolutions = resolutionIndex.resolutions or {}
+            resolvedConflicts[filePath] = resolutions[filePath]
             skippedCount = skippedCount + 1
         else
+            -- Log rebuild reason for debugging
+            if resolutionIndex.versionChanged then
+                log('D', 'ConflictResolver', 'Rebuilding ' .. filePath .. ' (version changed)')
+            end
+            
             if mergeConflictingFiles(filePath, modsList) then
                 local outputPath = MERGE_OUTPUT_DIR .. filePath
                 if FS:fileExists(outputPath) then
                     local outputContent = readFile(outputPath)
                     local outputHash = computeFileHash(outputContent)
                     recordResolution(filePath, modsList, outputHash, resolutionIndex)
-                    resolvedConflicts[filePath] = resolutionIndex[filePath]
+                    local resolutions = resolutionIndex.resolutions or {}
+                    resolvedConflicts[filePath] = resolutions[filePath]
                 end
                 resolvedCount = resolvedCount + 1
             end
         end
     end
     
-    return finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionIndex)
+    return finalizeConflictResolution(resolvedCount, skippedCount, totalConflicts, resolutionIndex.resolutions or {}, resolutionIndex.versionChanged)
 end
 
 local function resolveConflicts(forceRun)
@@ -2042,5 +2131,6 @@ M.recordResolution = recordResolution
 M.quickScanForPotentialConflicts = quickScanForPotentialConflicts
 M.computePartHashesForEntry = computePartHashesForEntry
 M.allPartHashesEqual = allPartHashesEqual
+M.stripBOM = stripBOM
 
 return M
