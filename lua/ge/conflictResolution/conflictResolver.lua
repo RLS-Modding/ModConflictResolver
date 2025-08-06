@@ -1,5 +1,7 @@
 local M = {}
 
+M.dependencies = {"conflictResolution_luaMerger"}
+
 local MERGE_OUTPUT_DIR = "/mods/ModConflictResolutions/"
 local SUPPORTED_EXTENSIONS = {".json", ".lua", ".forest4", ".level", ".prefab", ".jbeam", ".jsonl"}
 local RESOLVER_MOUNT_POINT = "/mods/ModConflictResolutions/"
@@ -1316,162 +1318,6 @@ local function mergeArrays(baseArray, overlayArray, arrayKey)
     return result
 end
 
-local function parseLuaFile(content)
-    content = stripBOM(content)
-    
-    local structure = {
-        header = "",
-        functions = {},
-        variables = {},
-        exports = {},
-        footer = ""
-    }
-    
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        line = stripBOM(line)
-        table.insert(lines, line)
-    end
-    
-    local inFunction = nil
-    local functionContent = {}
-    local i = 1
-    
-    while i <= #lines do
-        local line = lines[i]
-        local trimmedLine = line:match("^%s*(.-)%s*$")
-        
-        if not inFunction and (trimmedLine == "" or trimmedLine:startswith("--") or trimmedLine:startswith("local M = {}")) then
-            if structure.header == "" then
-                structure.header = line
-            else
-                structure.header = structure.header .. "\n" .. line
-            end
-        elseif trimmedLine:match("^local function (%w+)%(") then
-            local funcName = trimmedLine:match("^local function (%w+)%(")
-            inFunction = funcName
-            functionContent = {line}
-        elseif inFunction and trimmedLine:match("^end%s*$") then
-            table.insert(functionContent, line)
-            structure.functions[inFunction] = table.concat(functionContent, "\n")
-            inFunction = nil
-            functionContent = {}
-        elseif inFunction then
-            table.insert(functionContent, line)
-        elseif trimmedLine:match("^M%.(%w+)%s*=") then
-            local exportName = trimmedLine:match("^M%.(%w+)%s*=")
-            local exportValue = trimmedLine:match("^M%.%w+%s*=%s*(.+)$")
-            structure.exports[exportName] = exportValue
-        elseif trimmedLine:match("^return") or (trimmedLine ~= "" and not trimmedLine:startswith("--")) then
-            if structure.footer == "" then
-                structure.footer = line
-            else
-                structure.footer = structure.footer .. "\n" .. line
-            end
-        end
-        
-        i = i + 1
-    end
-    
-    return structure
-end
-
-local function mergeLuaFunctionContent(baseFuncContent, overlayFuncContent, functionName)
-    if not baseFuncContent then return overlayFuncContent end
-    if not overlayFuncContent then return baseFuncContent end
-    
-    if functionName == "onReset" or functionName == "updateGFX" then
-        local baseLines = {}
-        local overlayLines = {}
-        
-        for line in baseFuncContent:gmatch("[^\r\n]+") do
-            local trimmed = line:match("^%s*(.-)%s*$")
-            if not (trimmed:startswith("local function") or trimmed == "end" or trimmed == "" or trimmed:startswith("--")) then
-                table.insert(baseLines, line)
-            end
-        end
-        
-        for line in overlayFuncContent:gmatch("[^\r\n]+") do
-            local trimmed = line:match("^%s*(.-)%s*$") 
-            if not (trimmed:startswith("local function") or trimmed == "end" or trimmed == "" or trimmed:startswith("--")) then
-                local varName = trimmed:match("electrics%.values%[['\"](.-)['\"]%]")
-                if varName then
-                    local found = false
-                    for _, baseLine in ipairs(baseLines) do
-                        if baseLine:match("electrics%.values%[['\"]*" .. varName .. "['\"]%]") then
-                            found = true
-                            break
-                        end
-                    end
-                    if not found then
-                        table.insert(baseLines, line)
-                    end
-                else
-                    table.insert(baseLines, line)
-                end
-            end
-        end
-        
-        local funcHeader = baseFuncContent:match("(local function .-%(.-%))")
-        local result = funcHeader .. "\n"
-        for _, line in ipairs(baseLines) do
-            result = result .. line .. "\n"
-        end
-        result = result .. "end"
-        
-        return result
-    else
-        return baseFuncContent
-    end
-end
-
-local function mergeLua(baseStructure, overlayStructure)
-    local merged = {
-        header = baseStructure.header,
-        functions = {},
-        variables = {},
-        exports = {},
-        footer = baseStructure.footer
-    }
-    
-    for funcName, funcContent in pairs(baseStructure.functions) do
-        merged.functions[funcName] = funcContent
-    end
-    for funcName, funcContent in pairs(overlayStructure.functions) do
-        if merged.functions[funcName] then
-            merged.functions[funcName] = mergeLuaFunctionContent(merged.functions[funcName], funcContent, funcName)
-        else
-            merged.functions[funcName] = funcContent
-        end
-    end
-    
-    for exportName, exportValue in pairs(baseStructure.exports) do
-        merged.exports[exportName] = exportValue
-    end
-    for exportName, exportValue in pairs(overlayStructure.exports) do
-        merged.exports[exportName] = exportValue
-    end
-    
-    return merged
-end
-
-local function generateLuaContent(structure)
-    local content = structure.header .. "\n\n"
-    
-    for funcName, funcContent in pairs(structure.functions) do
-        content = content .. funcContent .. "\n\n"
-    end
-    
-    content = content .. "-- public interface\n"
-    for exportName, exportValue in pairs(structure.exports) do
-        content = content .. "M." .. exportName .. " = " .. exportValue .. "\n"
-    end
-    
-    content = content .. "\n" .. (structure.footer or "return M")
-    
-    return content
-end
-
 local function mergeJson(base, overlay)
     if type(base) ~= "table" or type(overlay) ~= "table" then
         return overlay
@@ -1802,17 +1648,13 @@ local function mergeConflictingFiles(filePath, modsList)
     local allObjects = {}
     local isJsonLines = false
 
+    local luaContents = {}
     local function processContent(content, modName)
         table.insert(sourceMods, modName)
 
         if isLuaFile then
             content = stripBOM(content)
-            local luaStructure = parseLuaFile(content)
-            if mergedData == nil then
-                mergedData = luaStructure
-            else
-                mergedData = mergeLua(mergedData, luaStructure)
-            end
+            table.insert(luaContents, content)
         elseif isJsonFile then
             content = stripBOM(content)
             local objects = parseJsonContent(content, filePath, modName)
@@ -1874,7 +1716,13 @@ local function mergeConflictingFiles(filePath, modsList)
         processContent(content, modName)
     end
     
-    if isJsonFile and #allObjects > 0 then
+    if isLuaFile and #luaContents > 0 then
+        if #luaContents == 1 then
+            mergedData = luaContents[1]
+        else
+            mergedData = conflictResolution_luaMerger.mergeContent(luaContents)
+        end
+    elseif isJsonFile and #allObjects > 0 then
         if isJsonLines then
             local mergedObjects = mergeJsonLines(allObjects, filePath, modsList)
             local jsonContent = objectsToJsonFormat(mergedObjects, filePath, true)
@@ -1906,8 +1754,7 @@ local function mergeConflictingFiles(filePath, modsList)
     
     local success = false
     if isLuaFile then
-        local luaContent = generateLuaContent(mergedData)
-        success = writeFile(outputPath, luaContent)
+        success = writeFile(outputPath, mergedData)
     elseif isJsonFile then
         if isJsonLines then
             success = writeFile(outputPath, mergedData)
