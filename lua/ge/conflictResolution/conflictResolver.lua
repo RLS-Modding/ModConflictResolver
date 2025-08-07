@@ -1,7 +1,5 @@
 local M = {}
 
-M.dependencies = {"conflictResolution_luaMerger"}
-
 local MERGE_OUTPUT_DIR = "/mods/ModConflictResolutions/"
 local SUPPORTED_EXTENSIONS = {".json", ".lua", ".forest4", ".level", ".prefab", ".jbeam", ".jsonl"}
 local RESOLVER_MOUNT_POINT = "/mods/ModConflictResolutions/"
@@ -1720,7 +1718,7 @@ local function mergeConflictingFiles(filePath, modsList)
         if #luaContents == 1 then
             mergedData = luaContents[1]
         else
-            mergedData = conflictResolution_luaMerger.mergeContent(luaContents)
+            mergedData = conflictResolution_luaMerger.mergeFiles(luaContents)
         end
     elseif isJsonFile and #allObjects > 0 then
         if isJsonLines then

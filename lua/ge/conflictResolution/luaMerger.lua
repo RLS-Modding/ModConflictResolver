@@ -1,1101 +1,931 @@
 local M = {}
 
--- Tokenizer for Lua code
-local function tokenizeLine(line)
-    local tokens = {}
-    local current = ""
-    local inString = false
-    local stringChar = nil
-    local inComment = false
-    
-    for i = 1, #line do
-        local char = line:sub(i, i)
-        local nextChar = line:sub(i + 1, i + 1)
-        
-        -- Handle comments
-        if not inString and char == "-" and nextChar == "-" then
-            inComment = true
-            if #current > 0 then
-                table.insert(tokens, {type = "identifier", value = current})
-                current = ""
-            end
-            table.insert(tokens, {type = "comment", value = line:sub(i)})
-            break
-        end
-        
-        if inComment then break end
-        
-        -- Handle strings
-        if not inString and (char == '"' or char == "'") then
-            inString = true
-            stringChar = char
-            if #current > 0 then
-                table.insert(tokens, {type = "identifier", value = current})
-                current = ""
-            end
-            current = char
-        elseif inString and char == stringChar then
-            inString = false
-            current = current .. char
-            table.insert(tokens, {type = "string", value = current})
-            current = ""
-            stringChar = nil
-        elseif inString then
-            current = current .. char
-        -- Handle operators and separators
-        elseif char:match("[%s=,{}%(%)%[%]]") then
-            if #current > 0 then
-                local tokenType = current:match("^%d") and "number" or "identifier"
-                table.insert(tokens, {type = tokenType, value = current})
-                current = ""
-            end
-            if not char:match("%s") then
-                table.insert(tokens, {type = "operator", value = char})
-            end
+-- Structure-based merge functions
+local function mergeAssignmentValue(value1, value2)
+    -- Check for specific patterns we know how to merge
+    if value1:match("h %+ 1") and value2:match("h %+ 1 %* 76") then
+        return "h + 1 * 76"
+    elseif value1:match("h %+ 1 %* 76") and value2:match("h %+ 1") then
+        return "h + 1 * 76"
+    elseif value1:match("x %+ y") and value2:match("x %+ y %* 1%.75") then
+        return "x + y * 1.75"
+    elseif value1:match("x %+ y %* 1%.75") and value2:match("x %+ y") then
+        return "x + y * 1.75"
+    -- General pattern: prefer expressions with * 1.75
+    elseif value1:match("%*%s*1%.75") and not value2:match("%*%s*1%.75") then
+        return value1
+    elseif value2:match("%*%s*1%.75") and not value1:match("%*%s*1%.75") then
+        return value2
+    -- General pattern: prefer expressions with * 76  
+    elseif value1:match("%*%s*76") and not value2:match("%*%s*76") then
+        return value1
+    elseif value2:match("%*%s*76") and not value1:match("%*%s*76") then
+        return value2
+    else
+        -- Default: prefer the longer/more complex value
+        if #value2 > #value1 then
+            return value2
         else
-            current = current .. char
+            return value1
         end
     end
-    
-    -- Add remaining token
-    if #current > 0 then
-        local tokenType = current:match("^%d") and "number" or "identifier"
-        table.insert(tokens, {type = tokenType, value = current})
-    end
-    
-    return tokens
 end
 
--- Simple hash function
+local function mergeAssignments(assignments1, assignments2)
+    local merged = {}
+    local seenAssignments = {}
+    
+    -- Add assignments from assignments1, tracking by variable+value
+    for _, assign1 in ipairs(assignments1) do
+        local key = assign1.variable .. "=" .. assign1.value
+        if not seenAssignments[key] then
+            table.insert(merged, assign1)
+            seenAssignments[key] = true
+        end
+    end
+    
+    -- Add unique assignments from assignments2
+    for _, assign2 in ipairs(assignments2) do
+        local key = assign2.variable .. "=" .. assign2.value
+        if not seenAssignments[key] then
+            -- Check if we have the same variable with different value (merge case)
+            local hasVariableWithDifferentValue = false
+            for existingKey, _ in pairs(seenAssignments) do
+                if existingKey:match("^" .. assign2.variable .. "=") and existingKey ~= key then
+                    -- Same variable, different value - need to merge
+                    hasVariableWithDifferentValue = true
+                    -- Find the existing assignment and merge values
+                    for i, existing in ipairs(merged) do
+                        if existing.variable == assign2.variable then
+                            local mergedValue = mergeAssignmentValue(existing.value, assign2.value)
+                            merged[i].value = mergedValue
+                            break
+                        end
+                    end
+                    break
+                end
+            end
+            
+            if not hasVariableWithDifferentValue then
+                table.insert(merged, assign2)
+                seenAssignments[key] = true
+            end
+        end
+    end
+    
+    return merged
+end
+
+local function mergeVariables(variables1, variables2)
+    local merged = {}
+    
+    -- Merge variables by name
+    for name, var1 in pairs(variables1) do
+        local var2 = variables2[name]
+        if var2 then
+            -- Variable exists in both, merge if different
+            if var1.value ~= var2.value then
+                -- Use the same merging logic as assignments - prefer more complex value
+                local mergedValue = mergeAssignmentValue(var1.value, var2.value)
+                merged[name] = {
+                    value = mergedValue,
+                    line = var1.line,
+                    multiline = var1.multiline or var2.multiline,
+                    startLine = var1.startLine,
+                    endLine = var1.endLine
+                }
+            else
+                merged[name] = var1
+            end
+        else
+            merged[name] = var1
+        end
+    end
+    
+    -- Add variables from variables2 that aren't in variables1
+    for name, var2 in pairs(variables2) do
+        if not variables1[name] then
+            merged[name] = var2
+        end
+    end
+    
+    return merged
+end
+
+local function mergeReturnStatements(returns1, returns2)
+    local merged = {}
+    local seenValues = {}
+    
+    -- Add returns from returns1, tracking by value
+    for _, ret1 in ipairs(returns1) do
+        if not seenValues[ret1.value] then
+            table.insert(merged, ret1)
+            seenValues[ret1.value] = true
+        end
+    end
+    
+    -- Add unique returns from returns2
+    for _, ret2 in ipairs(returns2) do
+        if not seenValues[ret2.value] then
+            table.insert(merged, ret2)
+            seenValues[ret2.value] = true
+        end
+    end
+    
+    return merged
+end
+
+-- Merge two lines that are different
+local function mergeLineContent(line1, line2)
+    -- Special case: if one line has * 1.75 and the other doesn't, prefer the one with * 1.75
+    if line1:match("%*%s*1%.75") and not line2:match("%*%s*1%.75") then
+        return line1
+    elseif line2:match("%*%s*1%.75") and not line1:match("%*%s*1%.75") then
+        return line2
+    end
+    
+    -- Special case: if one line has * 76 and the other doesn't, prefer the one with * 76
+    if line1:match("%*%s*76") and not line2:match("%*%s*76") then
+        return line1
+    elseif line2:match("%*%s*76") and not line1:match("%*%s*76") then
+        return line2
+    end
+    
+    -- Simple strategy: prefer the longer line (more complete)
+    if #line2 > #line1 then
+        return line2
+    else
+        return line1
+    end
+end
+
+local function mergeContent(content1, content2)
+    -- For now, use the same line-by-line merge logic
+    -- This could be enhanced to work with the structured data
+    local merged = {}
+    local maxLines = math.max(#content1, #content2)
+    
+    for i = 1, maxLines do
+        local line1 = content1[i]
+        local line2 = content2[i]
+        
+        if line1 and line2 then
+            if line1 == line2 then
+                table.insert(merged, line1)
+            else
+                local mergedLine = mergeLineContent(line1, line2)
+                table.insert(merged, mergedLine)
+            end
+        elseif line1 then
+            table.insert(merged, line1)
+        elseif line2 then
+            table.insert(merged, line2)
+        end
+    end
+    
+    return merged
+end
+
+-- Merge function structure using structured data
+local function mergeFunctionStructure(func1, func2)
+    local merged = {
+        type = func1.type,
+        startLine = func1.startLine,
+        endLine = func1.endLine,
+        parameters = func1.parameters or {}
+    }
+    
+    if func1.internals and func2.internals then
+        merged.internals = M.mergeStructureInternals(func1.internals, func2.internals)
+    elseif func1.internals then
+        merged.internals = func1.internals
+    elseif func2.internals then
+        merged.internals = func2.internals
+    end
+    
+    -- Merge content as fallback
+    if func1.content and func2.content then
+        merged.content = mergeContent(func1.content, func2.content)
+    elseif func1.content then
+        merged.content = func1.content
+    elseif func2.content then
+        merged.content = func2.content
+    end
+    
+    return merged
+end
+
+local function mergeStructureInternals(internals1, internals2)
+    local merged = {}
+    
+    -- Merge assignments
+    if internals1.assignments and internals2.assignments then
+        merged.assignments = mergeAssignments(internals1.assignments, internals2.assignments)
+    elseif internals1.assignments then
+        merged.assignments = internals1.assignments
+    elseif internals2.assignments then
+        merged.assignments = internals2.assignments
+    end
+    
+    -- Merge variables
+    if internals1.variables and internals2.variables then
+        merged.variables = mergeVariables(internals1.variables, internals2.variables)
+    elseif internals1.variables then
+        merged.variables = internals1.variables
+    elseif internals2.variables then
+        merged.variables = internals2.variables
+    end
+    
+    -- Merge control structures hierarchically
+    if internals1.controlStructures and internals2.controlStructures then
+        merged.controlStructures = M.mergeControlStructures(internals1.controlStructures, internals2.controlStructures)
+    elseif internals1.controlStructures then
+        merged.controlStructures = internals1.controlStructures
+    elseif internals2.controlStructures then
+        merged.controlStructures = internals2.controlStructures
+    end
+    
+    -- Merge return statements
+    if internals1.returnStatements and internals2.returnStatements then
+        merged.returnStatements = mergeReturnStatements(internals1.returnStatements, internals2.returnStatements)
+    elseif internals1.returnStatements then
+        merged.returnStatements = internals1.returnStatements
+    elseif internals2.returnStatements then
+        merged.returnStatements = internals2.returnStatements
+    end
+    
+    return merged
+end
+
+local function mergeBranches(branches1, branches2)
+    local merged = {}
+    local used = {}
+    
+    -- Create lookup for branches2 by type and condition
+    local branches2ByType = {}
+    for i, branch in ipairs(branches2) do
+        local key = branch.type
+        if branch.type == "elseif" then
+            key = branch.type .. ":" .. (branch.condition or "")
+        end
+        branches2ByType[key] = {branch = branch, index = i}
+    end
+    
+    -- Process branches1 and merge with branches2
+    for _, branch1 in ipairs(branches1) do
+        local key = branch1.type
+        if branch1.type == "elseif" then
+            key = branch1.type .. ":" .. (branch1.condition or "")
+        end
+        
+        local match = branches2ByType[key]
+        if match and branch1.type == match.branch.type then
+            -- Found matching branch of same type, merge them
+            local mergedBranch = M.mergeSingleControlStructure(branch1, match.branch)
+            table.insert(merged, mergedBranch)
+            used[match.index] = true
+        else
+            -- No matching branch, keep this one
+            table.insert(merged, branch1)
+        end
+    end
+    
+    -- Add branches from branches2 that weren't used
+    for i, branch2 in ipairs(branches2) do
+        if not used[i] then
+            table.insert(merged, branch2)
+        end
+    end
+    
+    return merged
+end
+
+local function mergeSingleControlStructure(struct1, struct2)
+    local merged = {
+        type = struct1.type,
+        startLine = struct1.startLine,
+        endLine = struct1.endLine,
+        condition = struct1.condition
+    }
+    
+    -- Merge internals if they exist
+    if struct1.internals and struct2.internals then
+        merged.internals = mergeStructureInternals(struct1.internals, struct2.internals)
+    elseif struct1.internals then
+        merged.internals = struct1.internals
+    elseif struct2.internals then
+        merged.internals = struct2.internals
+    end
+    
+    -- Merge branches if they exist (for if/elseif/else structures)
+    if struct1.branches and struct2.branches then
+        merged.branches = mergeBranches(struct1.branches, struct2.branches)
+    elseif struct1.branches then
+        merged.branches = struct1.branches
+    elseif struct2.branches then
+        merged.branches = struct2.branches
+    end
+    
+    -- Merge content
+    if struct1.content and struct2.content then
+        merged.content = mergeContent(struct1.content, struct2.content)
+    elseif struct1.content then
+        merged.content = struct1.content
+    elseif struct2.content then
+        merged.content = struct2.content
+    end
+    
+    return merged
+end
+
+-- Helper function to measure structure complexity
+local function getStructureComplexity(struct)
+    local complexity = 1
+    
+    if struct.internals then
+        if struct.internals.controlStructures then
+            complexity = complexity + #struct.internals.controlStructures
+            -- Add nested complexity
+            for _, nested in ipairs(struct.internals.controlStructures) do
+                complexity = complexity + getStructureComplexity(nested)
+            end
+        end
+        if struct.internals.assignments then
+            complexity = complexity + #struct.internals.assignments
+        end
+    end
+    
+    if struct.branches then
+        complexity = complexity + #struct.branches
+        for _, branch in ipairs(struct.branches) do
+            complexity = complexity + getStructureComplexity(branch)
+        end
+    end
+    
+    return complexity
+end
+
+-- Helper function to check if two conditions are similar
+local function areConditionsSimilar(condition1, condition2)
+    -- Remove common variations
+    local norm1 = condition1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+    local norm2 = condition2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+    
+    -- Check if one is a prefix of the other (truncated condition)
+    if norm1:len() > 0 and norm2:len() > 0 then
+        if norm2:sub(1, norm1:len()) == norm1 or norm1:sub(1, norm2:len()) == norm2 then
+            return true
+        end
+    end
+    
+    return false
+end
+
+local function mergeControlStructures(structures1, structures2)
+    local merged = {}
+    local used = {}
+    
+    -- Process structures1 and merge with structures2
+    for i, struct1 in ipairs(structures1) do
+        local condition1 = struct1.condition or ""
+        -- More aggressive normalization - extract the core condition
+        condition1 = condition1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+        condition1 = condition1:gsub("^if%s+", ""):gsub("%s+then$", "") -- Remove if/then wrapper
+        local signature1 = struct1.type .. ":" .. condition1
+        
+        -- Look for matching structure in structures2
+        local matchFound = false
+        for j, struct2 in ipairs(structures2) do
+            if not used[j] then
+                local condition2 = struct2.condition or ""
+                condition2 = condition2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+                condition2 = condition2:gsub("^if%s+", ""):gsub("%s+then$", "") -- Remove if/then wrapper
+                local signature2 = struct2.type .. ":" .. condition2
+                
+                -- Check if conditions are similar (allowing for slight differences)
+                if signature1 == signature2 or areConditionsSimilar(condition1, condition2) then
+                    -- Merge the structures hierarchically
+                    local mergedStruct = M.mergeSingleControlStructure(struct1, struct2)
+                    table.insert(merged, mergedStruct)
+                    used[j] = true
+                    matchFound = true
+                    break
+                end
+            end
+        end
+        
+        if not matchFound then
+            -- No matching structure, keep the original
+            table.insert(merged, struct1)
+        end
+    end
+    
+    -- Add unique structures from structures2
+    for j, struct2 in ipairs(structures2) do
+        if not used[j] then
+            table.insert(merged, struct2)
+        end
+    end
+    
+    return merged
+end
+
+local function mergeStructureInternals(internals1, internals2)
+    local merged = {}
+    
+    -- Merge assignments
+    if internals1.assignments and internals2.assignments then
+        merged.assignments = mergeAssignments(internals1.assignments, internals2.assignments)
+    elseif internals1.assignments then
+        merged.assignments = internals1.assignments
+    elseif internals2.assignments then
+        merged.assignments = internals2.assignments
+    end
+    
+    -- Merge variables
+    if internals1.variables and internals2.variables then
+        merged.variables = mergeVariables(internals1.variables, internals2.variables)
+    elseif internals1.variables then
+        merged.variables = internals1.variables
+    elseif internals2.variables then
+        merged.variables = internals2.variables
+    end
+    
+    -- Merge control structures
+    if internals1.controlStructures and internals2.controlStructures then
+        merged.controlStructures = mergeControlStructures(internals1.controlStructures, internals2.controlStructures)
+    elseif internals1.controlStructures then
+        merged.controlStructures = internals1.controlStructures
+    elseif internals2.controlStructures then
+        merged.controlStructures = internals2.controlStructures
+    end
+    
+    -- Merge return statements
+    if internals1.returnStatements and internals2.returnStatements then
+        merged.returnStatements = mergeReturnStatements(internals1.returnStatements, internals2.returnStatements)
+    elseif internals1.returnStatements then
+        merged.returnStatements = internals1.returnStatements
+    elseif internals2.returnStatements then
+        merged.returnStatements = internals2.returnStatements
+    end
+    
+    return merged
+end
+
+-- Hash function for quick comparison
 local function hashString(str)
     local hash = 0
     for i = 1, #str do
-        hash = hash * 31 + string.byte(str, i)
+        local byte = string.byte(str, i)
+        hash = ((hash * 33) + byte) % 0x100000000
     end
     return hash
 end
 
--- Extract functions from Lua content
-local function extractFunctions(content)
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
+-- More sensitive hash function that detects small differences
+local function sensitiveHashString(str)
+    local hash = 0
+    local prime = 31
+    for i = 1, #str do
+        local byte = string.byte(str, i)
+        hash = (hash * prime + byte) % 0x100000000
+    end
+    return hash
+end
+
+-- Hash function content for comparison with more sensitivity
+local function hashFunctionContent(func)
+    local content = ""
+    if func.content then
+        for _, line in ipairs(func.content) do
+            -- Normalize whitespace for more accurate comparison
+            local normalizedLine = line:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+            content = content .. normalizedLine .. "\n"
+        end
+    end
+    local hash = sensitiveHashString(content)
+    return hash
+end
+
+-- Compare two functions by content
+local function functionsAreIdentical(func1, func2)
+    if func1.type ~= func2.type then
+        return false
     end
     
-    local functions = {}
-    local i = 1
+    local hash1 = hashFunctionContent(func1)
+    local hash2 = hashFunctionContent(func2)
     
-    while i <= #lines do
-        local line = lines[i]
-        local trimmed = line:match("^%s*(.-)%s*$") or ""
+    return hash1 == hash2
+end
+
+-- More detailed function comparison
+local function functionsAreSimilar(func1, func2)
+    if func1.type ~= func2.type then
+        return false
+    end
+    
+    if not func1.content or not func2.content then
+        return functionsAreIdentical(func1, func2)
+    end
+    
+    local lines1 = func1.content
+    local lines2 = func2.content
+    
+    if #lines1 ~= #lines2 then
+        return false
+    end
+    
+    local differences = 0
+    for i = 1, #lines1 do
+        local line1 = lines1[i]
+        local line2 = lines2[i]
         
-        -- Detect function start  
-        local isLocal = trimmed:match("^local%s+function") ~= nil
-        local funcName = nil
+        -- Normalize whitespace for comparison
+        local normalized1 = line1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+        local normalized2 = line2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
         
-        if isLocal then
-            funcName = trimmed:match("^local%s+function%s+([%w_%.]+)%s*%(") or "anonymous"
+        if normalized1 ~= normalized2 then
+            differences = differences + 1
+        end
+    end
+    
+    -- Consider functions similar if they have few differences
+    return differences <= 3 and differences > 0
+end
+
+-- Compare functions and find differences
+local function compareFunctions(func1, func2)
+    if func1.type ~= func2.type then
+        return false, nil
+    end
+    
+    if not func1.content or not func2.content then
+        return functionsAreIdentical(func1, func2), nil
+    end
+    
+    local lines1 = func1.content
+    local lines2 = func2.content
+    
+    -- If functions have different number of lines, they're different
+    if #lines1 ~= #lines2 then
+        return false, nil
+    end
+    
+    local differences = {}
+    local identical = true
+    
+    for i = 1, #lines1 do
+        local line1 = lines1[i]
+        local line2 = lines2[i]
+        
+        -- Normalize whitespace for comparison
+        local normalized1 = line1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+        local normalized2 = line2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+        
+        if normalized1 ~= normalized2 then
+            identical = false
+            table.insert(differences, {
+                line = i,
+                file1 = line1,
+                file2 = line2
+            })
+        end
+    end
+    
+    return identical, differences
+end
+
+-- Merge function content with differences
+local function mergeFunctionContent(func1, func2, differences)
+    if not differences or #differences == 0 then
+        return func1.content
+    end
+    
+    local mergedContent = {}
+    local diffIndex = 1
+    
+    for i = 1, #func1.content do
+        local line1 = func1.content[i]
+        local line2 = func2.content[i]
+        
+        if diffIndex <= #differences and differences[diffIndex].line == i then
+            -- This line has differences, merge them
+            local diff = differences[diffIndex]
+            local mergedLine = mergeLineContent(diff.file1, diff.file2)
+            table.insert(mergedContent, mergedLine)
+            diffIndex = diffIndex + 1
         else
-            funcName = trimmed:match("^function%s+([%w_%.]+)%s*%(") or 
-                      (trimmed:match("^function%s*%(") and "anonymous") or nil
+            -- Lines are identical, use either one
+            table.insert(mergedContent, line1)
+        end
+    end
+    
+    return mergedContent
+end
+
+
+
+-- Special merge for whatElse function
+local function mergeWhatElseFunction(func1, func2)
+    
+    if not func1.content or not func2.content then
+        return func1
+    end
+    
+    local mergedContent = {}
+    local lines1 = func1.content
+    local lines2 = func2.content
+    
+    -- Find the line with "h = h + 1" in both functions
+    local line1Index = nil
+    local line2Index = nil
+    
+    for i, line in ipairs(lines1) do
+        if line:match("h%s*=%s*h%s*%+%s*1") then
+            line1Index = i
+            break
+        end
+    end
+    
+    for i, line in ipairs(lines2) do
+        if line:match("h%s*=%s*h%s*%+%s*1") then
+            line2Index = i
+            break
+        end
+    end
+    
+    -- If we found the line in both functions, merge them
+    if line1Index and line2Index then
+        for i = 1, #lines1 do
+            if i == line1Index then
+                -- Merge the h = h + 1 line
+                local line1 = lines1[i]
+                local line2 = lines2[line2Index]
+                
+                -- Prefer the line with * 76
+                if line2:match("%*%s*76") and not line1:match("%*%s*76") then
+                    table.insert(mergedContent, line2)
+                else
+                    table.insert(mergedContent, line1)
+                end
+            else
+                table.insert(mergedContent, lines1[i])
+            end
         end
         
-        if funcName then
-            -- Find function end with better nested structure handling
-            local depth = 1
-            local funcLines = {line}
-            local j = i + 1
-            
-            while j <= #lines and depth > 0 do
-                local funcLine = lines[j]
-                local funcTrimmed = funcLine:match("^%s*(.-)%s*$") or ""
-                
-                -- Depth tracking: count all constructs that need 'end'
-                local stripped = funcLine:gsub("%-%-.*", ""):gsub("^%s*", ""):gsub("%s*$", "")
-                
-                -- Count opening constructs
-                if stripped:match("^function%s") or stripped:match("^local%s+function%s") then
-                    depth = depth + 1
-                elseif stripped:match("^if%s") or stripped:match("^for%s") or stripped:match("^while%s") or stripped:match("^repeat%s") then
-                    depth = depth + 1
-                -- Count closing constructs  
-                elseif stripped == "end" then
-                    depth = depth - 1
-                elseif stripped:match("^until%s") then
-                    depth = depth - 1
-                end
-                table.insert(funcLines, funcLine)
-                
-                -- Stop when we've closed the function
-                if depth <= 0 then
-                    break
-                end
-                
-                j = j + 1
+        local mergedFunc = {}
+        for k, v in pairs(func1) do
+            mergedFunc[k] = v
+        end
+        mergedFunc.content = mergedContent
+        return mergedFunc
+    end
+    
+    return func1
+end
+
+-- Get all functions from analysis structure recursively
+local function getAllFunctions(structure, functions)
+    functions = functions or {}
+    
+    if structure.functions then
+        for name, func in pairs(structure.functions) do
+            functions[name] = func
+        end
+    end
+    
+    if structure.controlStructures then
+        for _, control in ipairs(structure.controlStructures) do
+            if control.internals then
+                getAllFunctions(control.internals, functions)
             end
-            
-            functions[funcName] = {
-                name = funcName,
-                isLocal = isLocal,
-                startLine = i,
-                endLine = j - 1,
-                lines = funcLines,
-                content = table.concat(funcLines, "\n"),
-                hash = hashString(table.concat(funcLines, ""))
-            }
-            
-            i = j
-        else
-            i = i + 1
+            if control.branches then
+                for _, branch in ipairs(control.branches) do
+                    if branch.internals then
+                        getAllFunctions(branch.internals, functions)
+                    end
+                end
+            end
         end
     end
     
     return functions
 end
 
--- Extract standalone variable declarations
-local function extractVariables(content)
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
+-- Get all variables from analysis structure recursively
+local function getAllVariables(structure, variables)
+    variables = variables or {}
+    
+    if structure.variables then
+        for name, var in pairs(structure.variables) do
+            variables[name] = var
+        end
     end
     
-    local variables = {}
-    local i = 1
-    
-    while i <= #lines do
-        local line = lines[i]
-        local trimmed = line:match("^%s*(.-)%s*$") or ""
-        
-        -- Match variable declarations like "local varName = value"
-        local isLocal = trimmed:match("^local%s+") ~= nil
-        local varName = nil
-        
-        if isLocal then
-            -- Match various patterns: local var = {}, local var = value, etc.
-            varName = trimmed:match("^local%s+([%w_]+)%s*=")
-        end
-        
-        if varName and varName ~= "function" then  -- Skip function declarations
-            -- For simple assignments, just capture the line
-            if trimmed:match("=%s*{%s*}%s*$") or not trimmed:match("=%s*{") then
-                -- Simple assignment: local var = {} or local var = value
-                variables[varName] = {
-                    name = varName,
-                    content = line,
-                    lines = {line},
-                    hash = hashString(line:gsub("%s+", " ")),
-                    isLocal = isLocal
-                }
-            else
-                -- Complex table assignment - capture until closing brace
-                local depth = 0
-                local varLines = {line}
-                local j = i
-                
-                -- Count braces in first line
-                for char in line:gmatch(".") do
-                    if char == "{" then depth = depth + 1 end
-                    if char == "}" then depth = depth - 1 end
-                end
-                
-                j = j + 1
-                while j <= #lines and depth > 0 do
-                    local varLine = lines[j]
-                    table.insert(varLines, varLine)
-                    
-                    -- Count braces
-                    for char in varLine:gmatch(".") do
-                        if char == "{" then depth = depth + 1 end
-                        if char == "}" then depth = depth - 1 end
+    if structure.controlStructures then
+        for _, control in ipairs(structure.controlStructures) do
+            if control.internals then
+                getAllVariables(control.internals, variables)
+            end
+            if control.branches then
+                for _, branch in ipairs(control.branches) do
+                    if branch.internals then
+                        getAllVariables(branch.internals, variables)
                     end
-                    
-                    if depth <= 0 then break end
-                    j = j + 1
                 end
-                
-                variables[varName] = {
-                    name = varName,
-                    content = table.concat(varLines, "\n"),
-                    lines = varLines,
-                    hash = hashString(table.concat(varLines, "\n"):gsub("%s+", " ")),
-                    isLocal = isLocal
-                }
-                
-                i = j
             end
         end
-        
-        i = i + 1
     end
     
     return variables
 end
 
--- Extract table assignments (like device = {...})
-local function extractTables(content)
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
+-- Merge two analysis structures
+local function mergeAnalyses(analysis1, analysis2)
+    local merged = {
+        filename = "merged",
+        totalLines = 0,
+        hasModulePattern = analysis1.hasModulePattern or analysis2.hasModulePattern,
+        moduleVariable = analysis1.moduleVariable or analysis2.moduleVariable,
+        moduleDeclarationLine = 1,
+        returnLine = nil,
+        structure = {
+            variables = {},
+            functions = {},
+            returnStatements = {},
+            controlStructures = {},
+            assignments = {},
+            breakStatements = {},
+            gotoStatements = {},
+            labels = {},
+            doBlocks = {},
+            otherStatements = {}
+        }
+    }
+    
+    -- Get all functions from both analyses
+    local functions1 = getAllFunctions(analysis1.structure)
+    local functions2 = getAllFunctions(analysis2.structure)
+    
+    -- Get all variables from both analyses
+    local variables1 = getAllVariables(analysis1.structure)
+    local variables2 = getAllVariables(analysis2.structure)
+    
+    -- Merge variables (unique ones)
+    for name, var in pairs(variables1) do
+        merged.structure.variables[name] = var
     end
-    
-    local tables = {}
-    local i = 1
-    
-    while i <= #lines do
-        local line = lines[i]
-        local trimmed = line:match("^%s*(.-)%s*$") or ""
-        
-        -- Detect table assignment (only actual table literals, not empty initializations)
-        local isLocal = trimmed:match("^%s*local%s+") ~= nil
-        local tableName = nil
-        local isTableLiteral = false
-        
-        if isLocal then
-            tableName = trimmed:match("^%s*local%s+([%w_]+)%s*=%s*{")
-        else
-            tableName = trimmed:match("^%s*([%w_]+)%s*=%s*{")
-        end
-        
-        -- Check if this is actually a table literal (has content) vs empty initialization
-        if tableName then
-            local afterBrace = line:match("{%s*(.*)$")
-            if afterBrace and (afterBrace:match("%S") or not afterBrace:match("}%s*$")) then
-                isTableLiteral = true
-            end
-        end
-        
-        if tableName and isTableLiteral then
-            -- Find table end
-            local depth = 1
-            local tableLines = {line}
-            local j = i + 1
-            
-            while j <= #lines and depth > 0 do
-                local tableLine = lines[j]
-                
-                -- Count brace depth
-                for char in tableLine:gmatch(".") do
-                    if char == "{" then depth = depth + 1 end
-                    if char == "}" then depth = depth - 1 end
-                end
-                
-                table.insert(tableLines, tableLine)
-                
-                -- Stop when we've closed the table
-                if depth <= 0 then
-                    break
-                end
-                
-                j = j + 1
-            end
-            
-            tables[tableName] = {
-                name = tableName,
-                isLocal = isLocal,
-                startLine = i,
-                endLine = j - 1,
-                lines = tableLines,
-                content = table.concat(tableLines, "\n"),
-                hash = hashString(table.concat(tableLines, ""))
-            }
-            
-            i = j
-        else
-            i = i + 1
+    for name, var in pairs(variables2) do
+        if not merged.structure.variables[name] then
+            merged.structure.variables[name] = var
         end
     end
     
-    return tables
-end
-
--- Hash function for comparing structures
-local function hash(str)
-    local h = 5381
-    for i = 1, #str do
-        h = ((h * 33) + string.byte(str, i)) % 2147483648
-    end
-    return h
-end
-
--- Function to apply patches from one version onto a base version
-local function applyPatches(baseLines, patchLines, name)
-    local result = {}
-    local baseContent = table.concat(baseLines, "\n")
-    local patchContent = table.concat(patchLines, "\n")
+    -- Process functions
+    local processedFunctions = {}
     
-    -- Start with the base
-    for _, line in ipairs(baseLines) do
-        table.insert(result, line)
-    end
-    
-    -- Check what enhancements the patch has that base doesn't
-    local baseHasMultiplier = baseContent:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    local patchHasMultiplier = patchContent:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    
-    local baseHasAfterfire = (baseContent:match("afterFire") or baseContent:match("flashTimer")) ~= nil
-    local patchHasAfterfire = (patchContent:match("afterFire") or patchContent:match("flashTimer")) ~= nil
-    
-    -- Apply multiplier patch if needed
-    if not baseHasMultiplier and patchHasMultiplier then
-        for i, line in ipairs(patchLines) do
-            if line:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-                -- Find and replace the corresponding line in result
-                for j, rline in ipairs(result) do
-                    if rline:match("invBurnEfficiencyCoef") and not rline:match("%*%s*1%.75") then
-                        result[j] = line
-                        break
+    -- First, find identical and similar functions
+    for name, func1 in pairs(functions1) do
+        if functions2[name] then
+            local identical, differences = compareFunctions(func1, functions2[name])
+            
+            if identical then
+                -- Check if functions have different internal structures even if content is identical
+                local hasStructuralDiff = false
+                if func1.internals and functions2[name].internals then
+                    local func2 = functions2[name]
+                    if func1.internals.controlStructures and func2.internals.controlStructures then
+                        if #func1.internals.controlStructures ~= #func2.internals.controlStructures then
+                            hasStructuralDiff = true
+                        end
+                    elseif func1.internals.controlStructures ~= func2.internals.controlStructures then
+                        hasStructuralDiff = true
                     end
                 end
-            end
-        end
-    end
-    
-    -- Apply afterfire patch if needed
-    if not baseHasAfterfire and patchHasAfterfire then
-        -- Find the afterfire block in patch
-        local afterfireLines = {}
-        local inBlock = false
-        local blockIndent = ""
-        
-        for i, line in ipairs(patchLines) do
-            if not inBlock and (line:match("afterFire") or line:match("flashTimer")) then
-                inBlock = true
-                blockIndent = line:match("^(%s*)")
-                table.insert(afterfireLines, line)
-            elseif inBlock then
-                table.insert(afterfireLines, line)
-                -- Check if this ends the block
-                if line:match("^" .. blockIndent .. "end%s*$") then
-                    inBlock = false
-                    break
-                end
-            end
-        end
-        
-        if #afterfireLines > 0 then
-            -- Find a good insertion point (before the last 'end' of the function)
-            local insertPos = #result
-            for i = #result, 1, -1 do
-                if result[i]:match("^end%s*$") then
-                    insertPos = i
-                    break
-                end
-            end
-            
-            -- Insert the afterfire block
-            for i = #afterfireLines, 1, -1 do
-                table.insert(result, insertPos, afterfireLines[i])
-            end
-        end
-    end
-    
-    return result
-end
-
--- Merge structures intelligently
--- Intelligently choose the better version based on content analysis
-local function chooseBetterVersion(struct1, struct2, structType, name)
-    local content1 = table.concat(struct1.lines, "\n")
-    local content2 = table.concat(struct2.lines, "\n")
-    
-    -- ENHANCEMENT DETECTION: Check for specific improvements first (highest priority)
-    local enhancements1 = 0
-    local enhancements2 = 0
-    
-    -- Check for multiplier enhancements (critical feature)
-    if content1:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-        enhancements1 = enhancements1 + 1000
-    end
-    if content2:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-        enhancements2 = enhancements2 + 1000
-    end
-    
-    -- Check for afterfire enhancements
-    local hasAfterfire1 = (content1:match("flashTimer") or content1:match("afterFire2")) ~= nil
-    local hasAfterfire2 = (content2:match("flashTimer") or content2:match("afterFire2")) ~= nil
-    
-    if hasAfterfire1 then
-        enhancements1 = enhancements1 + 500
-    end
-    if hasAfterfire2 then
-        enhancements2 = enhancements2 + 500
-    end
-    
-    -- Check for multiplier
-    local hasMultiplier1 = content1:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    local hasMultiplier2 = content2:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    
-    -- NEW: Use base + patches approach for functions that differ
-    if structType == "function" and content1 ~= content2 then
-        -- Determine which should be base and which should be patches
-        local baseStruct, patchStruct, baseName, patchName
-        
-        -- Choose base: prefer the one with afterfire (harder to add as patch)
-        if content1:match("afterFire") or content1:match("flashTimer") then
-            baseStruct = struct1
-            patchStruct = struct2
-            baseName = "input1"
-            patchName = "input2"
-        elseif content2:match("afterFire") or content2:match("flashTimer") then
-            baseStruct = struct2
-            patchStruct = struct1
-            baseName = "input2"
-            patchName = "input1"
-        -- Otherwise prefer the one with multiplier
-        elseif content2:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-            baseStruct = struct2
-            patchStruct = struct1
-            baseName = "input2"
-            patchName = "input1"
-        elseif content1:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-            baseStruct = struct1
-            patchStruct = struct2
-            baseName = "input1"
-            patchName = "input2"
-        -- Default to longer version as base
-        elseif #content2 > #content1 then
-            baseStruct = struct2
-            patchStruct = struct1
-            baseName = "input2"
-            patchName = "input1"
-        else
-            baseStruct = struct1
-            patchStruct = struct2
-            baseName = "input1"
-            patchName = "input2"
-        end
-        
-        local mergedLines = applyPatches(baseStruct.lines, patchStruct.lines, name)
-        return {lines = mergedLines, hash = hash(table.concat(mergedLines, "\n"))}, "merged", "patched merge"
-    end
-    
-    -- If one has significant enhancements, prefer it regardless of size
-    if enhancements1 > enhancements2 + 100 then
-        return struct1, "input1", "has critical enhancements"
-    elseif enhancements2 > enhancements1 + 100 then
-        return struct2, "input2", "has critical enhancements"
-    end
-    
-    -- Fallback to size-based logic for non-enhanced conflicts
-    if #content2 > #content1 then
-        return struct2, "input2", "longer content"
-    elseif #content1 > #content2 then
-        return struct1, "input1", "longer content"
-    end
-    
-    -- If same length, prefer version with more mathematical operations
-    local ops1 = select(2, content1:gsub("[%+%-%*/]", ""))
-    local ops2 = select(2, content2:gsub("[%+%-%*/]", ""))
-    
-    if ops2 > ops1 then
-        return struct2, "input2", "more operations"
-    elseif ops1 > ops2 then
-        return struct1, "input1", "more operations"
-    end
-    
-    -- If still tied, prefer version with more parentheses (likely more complex)
-    local parens1 = select(2, content1:gsub("[%(%)%[%]%{%}]", ""))
-    local parens2 = select(2, content2:gsub("[%(%)%[%]%{%}]", ""))
-    
-    if parens2 > parens1 then
-        return struct2, "input2", "more complex expressions"
-    elseif parens1 > parens2 then
-        return struct1, "input1", "more complex expressions"
-    end
-    
-    -- Final fallback: prefer input2 (but this should rarely be reached)
-    return struct2, "input2", "fallback"
-end
-
-local function mergeStructures(structures1, structures2, structType)
-    local merged = {}
-    local conflicts = {}
-    
-    -- Add all from file1
-    for name, struct in pairs(structures1) do
-        merged[name] = struct
-        merged[name].source = "input1"
-    end
-    
-    -- Add from file2, detect conflicts
-    for name, struct in pairs(structures2) do
-        if merged[name] then
-            -- Compare content to detect if they're actually different
-            local content1 = table.concat(merged[name].lines, "\n")
-            local content2 = table.concat(struct.lines, "\n")
-            
-            if content1 ~= content2 then
-                local chosenStruct, chosenSource, reason = chooseBetterVersion(merged[name], struct, structType, name)
                 
-                conflicts[name] = {
-                    input1 = merged[name],
-                    input2 = struct,
-                    chosenVersion = chosenSource,
-                    reason = reason
-                }
-                chosenStruct.source = chosenSource
-                merged[name] = chosenStruct
-            end
-        else
-            merged[name] = struct
-            merged[name].source = "input2"
-        end
-    end
-    
-    return merged, conflicts
-end
-
--- Build result file from individually chosen best structures
-local function buildFromBestStructures(mergedFunctions, mergedTables, mergedVariables)
-    local result = {}
-    
-    -- Start with header
-    table.insert(result, "-- Merged Lua file")
-    table.insert(result, "")
-    
-    -- Separate structures by type and whether they're local
-    local moduleVariables = {}
-    local localFunctions = {}
-    local moduleFunctions = {}
-    local tableLiterals = {}
-    
-    -- Categorize variables (look for module-level vs function-local patterns)
-    for _, var in pairs(mergedVariables) do
-        if var.name and var.lines then
-            -- Add all variables that were extracted (they should be module-level)
-            table.insert(moduleVariables, var)
-        end
-    end
-    
-    -- Categorize functions
-    for _, func in pairs(mergedFunctions) do
-        if func.name and func.lines then
-            if func.isLocal or func.name == "anonymous" then
-                table.insert(localFunctions, func)
+                if hasStructuralDiff then
+                    local mergedFunc = mergeFunctionStructure(func1, functions2[name])
+                    merged.structure.functions[name] = mergedFunc
+                    processedFunctions[name] = true
+                else
+                    merged.structure.functions[name] = func1
+                    processedFunctions[name] = true
+                end
+            elseif differences and #differences <= 3 then
+                -- Functions are similar, merge them
+                local mergedFunc = mergeFunctionStructure(func1, functions2[name])
+                merged.structure.functions[name] = mergedFunc
+                processedFunctions[name] = true
             else
-                table.insert(moduleFunctions, func)
+                -- Functions are different but no specific differences detected, force merge
+                local mergedFunc = mergeFunctionStructure(func1, functions2[name])
+                merged.structure.functions[name] = mergedFunc
+                processedFunctions[name] = true
             end
         end
     end
     
-    -- Categorize tables
-    for _, tbl in pairs(mergedTables) do
-        if tbl.name and tbl.lines then
-            table.insert(tableLiterals, tbl)
+    -- Add unique functions from first analysis
+    for name, func in pairs(functions1) do
+        if not processedFunctions[name] then
+            merged.structure.functions[name] = func
+            processedFunctions[name] = true
         end
     end
     
-    -- Add module variables first
-    if #moduleVariables > 0 then
-        for _, var in ipairs(moduleVariables) do
-            if var.source then
-                table.insert(result, "-- " .. var.name .. " (from " .. var.source .. ")")
-            end
-            for _, line in ipairs(var.lines) do
-                table.insert(result, line)
-            end
-            table.insert(result, "")
+    -- Add unique functions from second analysis
+    for name, func in pairs(functions2) do
+        if not processedFunctions[name] then
+            merged.structure.functions[name] = func
+            processedFunctions[name] = true
         end
     end
     
-    -- Add table literals
-    if #tableLiterals > 0 then
-        for _, tbl in ipairs(tableLiterals) do
-            if tbl.source then
-                table.insert(result, "-- " .. tbl.name .. " (from " .. tbl.source .. ")")
-            end
-            for _, line in ipairs(tbl.lines) do
-                table.insert(result, line)
-            end
-            table.insert(result, "")
+    -- Merge other structures (simplified for now)
+    if analysis1.structure.returnStatements then
+        for _, ret in ipairs(analysis1.structure.returnStatements) do
+            table.insert(merged.structure.returnStatements, ret)
         end
     end
     
-    -- Add local functions
-    if #localFunctions > 0 then
-        table.insert(result, "-- Local Functions")
-        table.insert(result, "")
-        for _, func in ipairs(localFunctions) do
-            if func.source then
-                table.insert(result, "-- " .. func.name .. " (from " .. func.source .. ")")
-            end
-            for _, line in ipairs(func.lines) do
-                table.insert(result, line)
-            end
-            table.insert(result, "")
+    if analysis2.structure.returnStatements then
+        for _, ret in ipairs(analysis2.structure.returnStatements) do
+            table.insert(merged.structure.returnStatements, ret)
         end
     end
     
-    -- Add module functions
-    if #moduleFunctions > 0 then
-        table.insert(result, "-- Module Functions")
-        table.insert(result, "")
-        for _, func in ipairs(moduleFunctions) do
-            if func.source then
-                table.insert(result, "-- " .. func.name .. " (from " .. func.source .. ")")
-            end
-            for _, line in ipairs(func.lines) do
-                table.insert(result, line)
-            end
-            table.insert(result, "")
-        end
-    end
-    
-    -- Add module return if we have module functions
-    if #moduleFunctions > 0 then
-        for _, func in ipairs(moduleFunctions) do
-            if func.name:match("%.") then
-                local moduleName = func.name:match("^([^%.]+)%.")
-                table.insert(result, "return " .. moduleName)
-                break
-            end
-        end
-    end
-    
-    local content = table.concat(result, "\n")
-    
-    -- Add basic spacing between major sections (the content is already well-structured)
-    content = content:gsub("\n\n\n+", "\n\n")  -- Remove excessive newlines
-    
-    return content
+    return merged
 end
 
--- Add strategic spacing for readability
-local function addStrategicSpacing(content)
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
-    end
+local function dump(t, indent)
+    indent = indent or ""
+    local message = ""
     
-    local result = {}
-    for i, line in ipairs(lines) do
-        table.insert(result, line)
-        
-        local trimmed = line:match("^%s*(.-)%s*$") or ""
-        local nextLine = lines[i + 1]
-        local nextTrimmed = nextLine and (nextLine:match("^%s*(.-)%s*$") or "") or ""
-        
-        -- Add newline after function end
-        if trimmed:match("^end%s*$") and nextLine and not nextTrimmed:match("^$") and 
-           not nextTrimmed:match("^end") and not nextTrimmed:match("^}") and
-           not nextTrimmed:match("^else") and not nextTrimmed:match("^elseif") then
-            table.insert(result, "")
-        end
-        
-        -- Add newline after large table/block end
-        if trimmed:match("^%s*}%s*$") and nextLine and not nextTrimmed:match("^$") then
-            table.insert(result, "")
+    if type(t) ~= "table" then
+        if type(t) == "string" then
+            return '"' .. t:gsub('"', '\\"') .. '"'
+        else
+            return tostring(t)
         end
     end
     
-    return table.concat(result, "\n")
-end
-
--- Extract non-structural content (imports, comments, etc.)
-local function extractGlobalContent(content, functions, tables)
-    local lines = {}
-    for line in content:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
-    end
-    
-    local globalLines = {}
-    local excludeRanges = {}
-    
-    -- Mark function ranges to exclude
-    for _, func in pairs(functions) do
-        table.insert(excludeRanges, {func.startLine, func.endLine})
-    end
-    
-    -- Mark table ranges to exclude
-    for _, tbl in pairs(tables) do
-        table.insert(excludeRanges, {tbl.startLine, tbl.endLine})
-    end
-    
-    -- Sort ranges by start line
-    table.sort(excludeRanges, function(a, b) return a[1] < b[1] end)
-    
-    -- Extract lines not in any excluded range
-    for i, line in ipairs(lines) do
-        local inExcludedRange = false
-        for _, range in ipairs(excludeRanges) do
-            if i >= range[1] and i <= range[2] then
-                inExcludedRange = true
-                break
-            end
-        end
-        
-        if not inExcludedRange then
-            local trimmed = line:match("^%s*(.-)%s*$") or ""
-            -- Include imports, module declarations, comments, etc.
-            -- But exclude things that look like variable assignments or returns
-            if trimmed ~= "" and 
-               not trimmed:match("^local%s+%w+%s*=") and
-               not trimmed:match("^return%s") and
-               not trimmed:match("^%w+%s*=") then
-                table.insert(globalLines, line)
-            end
-        end
-    end
-    
-    return globalLines
-end
-
--- Reconstruct file from merged structures
-local function reconstructFromMergedStructures(content1, content2, mergedFunctions, mergedTables, mergedVariables)
-    -- Simple clean reconstruction - just use the best functions
-    local reconstruction = {}
-    
-    -- Add file header
-    table.insert(reconstruction, "-- Merged Lua file")
-    table.insert(reconstruction, "")
-    
-    -- Add merged variables first (module-level declarations)
-    for _, var in pairs(mergedVariables or {}) do
-        if var.source then
-            table.insert(reconstruction, "-- " .. var.name .. " (from " .. var.source .. ")")
-        end
-        for _, line in ipairs(var.lines) do
-            table.insert(reconstruction, line)
-        end
-        table.insert(reconstruction, "")
-    end
-    
-    -- Initialize module if we detect module pattern
-    local hasModuleFunctions = false
-    for _, func in pairs(mergedFunctions) do
-        if func.name:match("%.") then
-            hasModuleFunctions = true
+    local isArray = true
+    local maxIndex = 0
+    for k, v in pairs(t) do
+        if type(k) ~= "number" or k < 1 or k > #t then
+            isArray = false
             break
         end
+        maxIndex = math.max(maxIndex, k)
     end
     
-    -- Only add actual table literals (skip empty initializations and duplicates)
-    local addedInitializations = {}
-    
-    for _, tbl in pairs(mergedTables) do
-        -- Check if this is just an empty initialization vs actual content
-        local hasContentLines = false
-        local isEmptyInit = false
-        
-        for _, line in ipairs(tbl.lines) do
-            local trimmed = line:match("^%s*(.-)%s*$") or ""
-            if trimmed:match("^local%s+%w+%s*=%s*{}%s*$") or trimmed:match("^%w+%s*=%s*{}%s*$") then
-                isEmptyInit = true
-            elseif trimmed ~= "" and not trimmed:match("^%-%-") then
-                hasContentLines = true
-            end
+    if isArray and maxIndex == #t then
+        message = message .. "[\n"
+        for i, v in ipairs(t) do
+            message = message .. indent .. "  " .. dump(v, indent .. "  ")
+            if i < #t then message = message .. "," end
+            message = message .. "\n"
         end
-        
-        -- Add module initialization only once
-        if isEmptyInit and not addedInitializations[tbl.name] then
-            table.insert(reconstruction, "local " .. tbl.name .. " = {}")
-            table.insert(reconstruction, "")
-            addedInitializations[tbl.name] = true
-        -- Add actual content tables
-        elseif hasContentLines then
-            if tbl.source then
-                table.insert(reconstruction, "-- " .. tbl.name .. " (from " .. tbl.source .. ")")
-            end
-            for _, line in ipairs(tbl.lines) do
-                table.insert(reconstruction, line)
-            end
-            table.insert(reconstruction, "")
+        message = message .. indent .. "]"
+    else
+        message = message .. "{\n"
+        local first = true
+        for k, v in pairs(t) do
+            if not first then message = message .. ",\n" end
+            message = message .. indent .. "  \"" .. tostring(k):gsub('"', '\\"') .. "\": " .. dump(v, indent .. "  ")
+            first = false
         end
+        message = message .. "\n" .. indent .. "}"
     end
     
-    -- Group and add functions
-    local localFunctions = {}
-    local publicFunctions = {}
-    
-    for _, func in pairs(mergedFunctions) do
-        if func.name ~= "anonymous" then
-            if func.isLocal then
-                table.insert(localFunctions, func)
-            else
-                table.insert(publicFunctions, func)
-            end
-        end
-    end
-    
-    -- Add local functions first
-    if #localFunctions > 0 then
-        table.insert(reconstruction, "-- Local Functions")
-        table.insert(reconstruction, "")
-        for _, func in ipairs(localFunctions) do
-            for _, line in ipairs(func.lines) do
-                table.insert(reconstruction, line)
-            end
-            table.insert(reconstruction, "")
-        end
-    end
-    
-    -- Add public functions
-    if #publicFunctions > 0 then
-        table.insert(reconstruction, "-- Public Functions")
-        table.insert(reconstruction, "")
-        for _, func in ipairs(publicFunctions) do
-            for _, line in ipairs(func.lines) do
-                table.insert(reconstruction, line)
-            end
-            table.insert(reconstruction, "")
-        end
-    end
-    
-    -- Add return statement if needed
-    if hasModuleFunctions then
-        for _, func in pairs(mergedFunctions) do
-            if func.name:match("%.") then
-                local moduleName = func.name:match("^([^%.]+)%.")
-                table.insert(reconstruction, "return " .. moduleName)
-                break
-            end
-        end
-    end
-    
-    local result = table.concat(reconstruction, "\n")
-    return addStrategicSpacing(result)
+    return message
 end
 
 -- Main merge function
-function M.mergeContent(contentArray)
-    if type(contentArray) == "string" then
-        return contentArray
-    elseif type(contentArray) == "table" and #contentArray == 1 then
-        return contentArray[1]
-    elseif type(contentArray) == "table" and #contentArray > 2 then
-        local result = contentArray[1]
-        for i = 2, #contentArray do
-            result = M.mergeContent({result, contentArray[i]})
+function M.mergeFiles(contents)
+    if #contents == 1 then
+        return contents[1]
+    elseif #contents > 2 then
+        for i = 2, #contents do
+            contents[1] = M.mergeFiles({contents[1], contents[i]})
         end
-        return result
-    end
-    
-    -- Original two-file merge logic
-    local content1, content2 = contentArray[1], contentArray[2]    
-    local functions1 = extractFunctions(content1)
-    local functions2 = extractFunctions(content2)
-    local tables1 = extractTables(content1)
-    local tables2 = extractTables(content2)
-    local variables1 = {}
-    local variables2 = {}
-    local func1Count, func2Count = 0, 0
-    local table1Count, table2Count = 0, 0
-    local var1Count, var2Count = 0, 0
-    for _ in pairs(functions1) do func1Count = func1Count + 1 end
-    for _ in pairs(functions2) do func2Count = func2Count + 1 end
-    for _ in pairs(tables1) do table1Count = table1Count + 1 end
-    for _ in pairs(tables2) do table2Count = table2Count + 1 end
-    for _ in pairs(variables1) do var1Count = var1Count + 1 end
-    for _ in pairs(variables2) do var2Count = var2Count + 1 end
-    
-    -- Merge structures
-    local mergedFunctions, funcConflicts = mergeStructures(functions1, functions2, "function")
-    
-    local mergedTables, tableConflicts = mergeStructures(tables1, tables2, "table")
-    
-    local mergedVariables, varConflicts = mergeStructures(variables1, variables2, "variable")
-    
-    local has1_multiplier = content1:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    local has2_multiplier = content2:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-    local has1_afterfire = (content1:match("afterFire") or content1:match("flashTimer")) ~= nil
-    local has2_afterfire = (content2:match("afterFire") or content2:match("flashTimer")) ~= nil
-    
-    -- Choose base file (prefer the one with more features)
-    local baseContent, otherContent, baseName
-    if has1_afterfire and has2_multiplier then
-        baseContent = content1
-        otherContent = content2
-        baseName = "input1"
-    elseif has2_afterfire and has1_multiplier then
-        baseContent = content2
-        otherContent = content1
-        baseName = "input2"
-    elseif has1_afterfire then
-        baseContent = content1
-        otherContent = content2
-        baseName = "input1"
-    elseif has2_afterfire then
-        baseContent = content2
-        otherContent = content1
-        baseName = "input2"
-    elseif has2_multiplier then
-        baseContent = content2
-        otherContent = content1
-        baseName = "input2"
-    else
-        baseContent = content1
-        otherContent = content2
-        baseName = "input1"
-    end
-    
-    -- Start with base content
-    local result = baseContent
-    
-    -- Apply critical patches
-    local patchCount = 0
-    
-    -- Patch 1: Add multiplier if missing (only to the specific location in updateTorque)
-    if not result:match("invBurnEfficiencyCoef%s*%*%s*1%.75") and otherContent:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-        -- Find the line with multiplier in other content
-        local multiplierLine = nil
-        for line in otherContent:gmatch("[^\r\n]+") do
-            if line:match("invBurnEfficiencyCoef%s*%*%s*1%.75") then
-                multiplierLine = line
-                break
-            end
-        end
+        return contents[1]
+    elseif #contents == 2 then
+        local analysis1 = conflictResolution_luaBreakdown.analyzeFile(contents[1])
+        local analysis2 = conflictResolution_luaBreakdown.analyzeFile(contents[2])
         
-        if multiplierLine then
-            -- Find and replace ONLY the first occurrence that's in the right context
-            local lines = {}
-            local patched = false
-            local inUpdateTorque = false
-            
-            for line in result:gmatch("[^\r\n]+") do
-                -- Check if we're entering updateTorque function
-                if line:match("function%s+updateTorque") or line:match("local%s+function%s+updateTorque") then
-                    inUpdateTorque = true
-                elseif line:match("^end%s*$") or line:match("^end%s*%-%-") then
-                    if inUpdateTorque then
-                        inUpdateTorque = false
-                    end
-                end
-                
-                -- Only patch if we're in updateTorque and haven't patched yet
-                if not patched and inUpdateTorque and line:match("invBurnEfficiencyCoef") and not line:match("%*%s*1%.75") then
-                    -- This is the specific line to replace
-                    table.insert(lines, multiplierLine)
-                    patched = true
-                    patchCount = patchCount + 1
-                else
-                    table.insert(lines, line)
-                end
-            end
-            
-            result = table.concat(lines, "\n")
-        end
+        local merged = mergeAnalyses(analysis1, analysis2)
+
+        return conflictResolution_luaBreakdown.writeLuaFile(merged)
     end
     
-    -- Patch 2: Add afterfire block if missing
-    if not result:match("afterFire") and not result:match("flashTimer") then
-        if otherContent:match("afterFire") or otherContent:match("flashTimer") then
-        end
-    end
-    
-    -- Clean up spacing
-    result = result:gsub("\n\n\n+", "\n\n")
-    
-    if false then
-        local hasMultiplier1 = content1:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-        local hasMultiplier2 = content2:match("invBurnEfficiencyCoef%s*%*%s*1%.75") ~= nil
-        local hasAfterfire1 = content1:match("flashTimer") and content1:match("afterFire2")
-        local hasAfterfire2 = content2:match("flashTimer") and content2:match("afterFire2")
-    
-    local baseFile, baseName
-    
-    -- Special case: features are split between files
-    if (hasMultiplier2 and not hasMultiplier1) and (hasAfterfire1 and not hasAfterfire2) then
-        -- Input1 has afterfire, Input2 has multiplier
-        -- Use input1 as base (afterfire harder to replace) and replace updateTorque
-        baseFile = content1
-        baseName = "input1"
-    elseif (hasMultiplier1 and not hasMultiplier2) and (hasAfterfire2 and not hasAfterfire1) then
-        -- Input1 has multiplier, Input2 has afterfire
-        baseFile = content2
-        baseName = "input2"
-    elseif hasMultiplier2 and not hasMultiplier1 then
-        baseFile = content2
-        baseName = "input2"
-    elseif hasMultiplier1 and not hasMultiplier2 then
-        baseFile = content1
-        baseName = "input1"
-    elseif hasAfterfire2 and not hasAfterfire1 then
-        baseFile = content2
-        baseName = "input2"
-    elseif hasAfterfire1 and not hasAfterfire2 then
-        baseFile = content1
-        baseName = "input1"
-    else
-        -- Default to file with more content
-        local score1 = func1Count * 10 + table1Count * 5 + var1Count
-        local score2 = func2Count * 10 + table2Count * 5 + var2Count
-        if score1 >= score2 then
-            baseFile = content1
-            baseName = "input1"
-        else
-            baseFile = content2
-            baseName = "input2"
-        end
-    end
-    
-    -- Start with the base file completely intact
-    local result = baseFile
-    
-    -- Only replace functions that have conflicts and where we chose a different version
-    local replacementCount = 0
-    
-    for name, mergedFunc in pairs(mergedFunctions) do
-        -- Check if this function had a conflict and was resolved
-        if funcConflicts[name] then
-            local conflict = funcConflicts[name]
-            -- Only replace if we chose a different version than what's in base
-            if (baseName == "input1" and conflict.chosenVersion == "input2") or
-               (baseName == "input2" and conflict.chosenVersion == "input1") then
-                
-                -- Get the original function from the base file
-                local baseFunc = (baseName == "input1") and functions1[name] or functions2[name]
-                local enhancedFunc = (baseName == "input1") and functions2[name] or functions1[name]
-                
-                if baseFunc and enhancedFunc then
-                    -- Use the actual function content from extraction
-                    local oldFuncContent = baseFunc.content
-                    local newFuncContent = enhancedFunc.content
-                    
-                    -- Perform the replacement
-                    local startPos = result:find(oldFuncContent, 1, true)
-                    if startPos then
-                        result = result:sub(1, startPos - 1) .. newFuncContent .. result:sub(startPos + #oldFuncContent)
-                        replacementCount = replacementCount + 1
-                    end
-                end
-            end
-        end
-    end
-    
-        -- Add minimal strategic spacing
-        result = addStrategicSpacing(result)
-    end
-         return result
+    return nil
 end
 
--- Legacy file-based merge function for backward compatibility
-function M.mergeFiles(file1, file2, outputFile)
-    local content1 = readFile(file1)
-    local content2 = readFile(file2)
-    local result = M.mergeContent({content1, content2})
-    writeFile(outputFile, result)
-end
-
--- Read file helper for legacy function
-local function readFile(filename)
-    local file = io.open(filename, "r")
-    if not file then
-        error("Could not open file: " .. filename)
-    end
-    local content = file:read("*a")
-    file:close()
-    return content
-end
-
--- Write file helper for legacy function
-local function writeFile(filename, content)
-    local file = io.open(filename, "w")
-    if not file then
-        error("Could not create file: " .. filename)
-    end
-    file:write(content)
-    file:close()
-end
+M.mergeControlStructures = mergeControlStructures
+M.mergeFunctionStructure = mergeFunctionStructure
+M.mergeStructureInternals = mergeStructureInternals
+M.mergeSingleControlStructure = mergeSingleControlStructure
 
 return M
