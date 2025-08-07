@@ -1,5 +1,41 @@
 local M = {}
 
+-- Simple analysis cache to avoid reprocessing identical content
+local ANALYSIS_CACHE_MAX = 128
+local analysisCache = {}
+local analysisCacheOrder = {}
+
+local function cachePut(key, value)
+    if not analysisCache[key] then
+        analysisCacheOrder[#analysisCacheOrder + 1] = key
+    end
+    analysisCache[key] = value
+    if #analysisCacheOrder > ANALYSIS_CACHE_MAX then
+        local trim = math.floor(ANALYSIS_CACHE_MAX / 2)
+        for i = 1, trim do
+            local k = analysisCacheOrder[i]
+            analysisCache[k] = nil
+        end
+        local newOrder = {}
+        for i = trim + 1, #analysisCacheOrder do
+            newOrder[#newOrder + 1] = analysisCacheOrder[i]
+        end
+        analysisCacheOrder = newOrder
+    end
+end
+
+local function cacheGet(key)
+    return analysisCache[key]
+end
+
+local function fastHash(s)
+    local h = 5381
+    for i = 1, #s do
+        h = ((h * 33) + string.byte(s, i)) % 0x100000000
+    end
+    return tostring(h)
+end
+
 -- Pattern matching utilities
 local function trimWhitespace(str)
     if not str then return "" end
@@ -990,6 +1026,10 @@ function M.analyzeFile(content)
     local lines = {}
     -- Handle both \n and \r\n line endings, and preserve empty lines
     content = content:gsub("\r\n", "\n"):gsub("\r", "\n")
+
+    local contentHash = fastHash(content)
+    local cached = cacheGet(contentHash)
+    if cached then return cached end
     for line in (content .. "\n"):gmatch("([^\n]*)\n") do
         table.insert(lines, line)
     end
@@ -1008,6 +1048,7 @@ function M.analyzeFile(content)
         structure = structure
     }
     
+    cachePut(contentHash, analysis)
     return analysis
 end
 

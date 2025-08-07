@@ -164,25 +164,14 @@ local function mergeContent(content1, content2)
     -- This could be enhanced to work with the structured data
     local merged = {}
     local maxLines = math.max(#content1, #content2)
-    
     for i = 1, maxLines do
-        local line1 = content1[i]
-        local line2 = content2[i]
-        
-        if line1 and line2 then
-            if line1 == line2 then
-                table.insert(merged, line1)
-            else
-                local mergedLine = mergeLineContent(line1, line2)
-                table.insert(merged, mergedLine)
-            end
-        elseif line1 then
-            table.insert(merged, line1)
-        elseif line2 then
-            table.insert(merged, line2)
+        local l1, l2 = content1[i], content2[i]
+        if l1 and l2 then
+            merged[#merged + 1] = (l1 == l2) and l1 or mergeLineContent(l1, l2)
+        else
+            merged[#merged + 1] = l1 or l2
         end
     end
-    
     return merged
 end
 
@@ -255,6 +244,21 @@ local function mergeStructureInternals(internals1, internals2)
     end
     
     return merged
+end
+
+-- Cache normalized function content to avoid repeated gsubs
+local normalizedContentCache = setmetatable({}, { __mode = "k" })
+local function getNormalizedContent(func)
+    local cached = normalizedContentCache[func]
+    if cached then return cached end
+    local lines = {}
+    if func and func.content then
+        for _, line in ipairs(func.content) do
+            lines[#lines + 1] = line:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+        end
+    end
+    normalizedContentCache[func] = lines
+    return lines
 end
 
 local function mergeBranches(branches1, branches2)
@@ -495,14 +499,8 @@ end
 
 -- Hash function content for comparison with more sensitivity
 local function hashFunctionContent(func)
-    local content = ""
-    if func.content then
-        for _, line in ipairs(func.content) do
-            -- Normalize whitespace for more accurate comparison
-            local normalizedLine = line:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-            content = content .. normalizedLine .. "\n"
-        end
-    end
+    local normalizedLines = getNormalizedContent(func)
+    local content = table.concat(normalizedLines, "\n") .. "\n"
     local hash = sensitiveHashString(content)
     return hash
 end
@@ -529,8 +527,8 @@ local function functionsAreSimilar(func1, func2)
         return functionsAreIdentical(func1, func2)
     end
     
-    local lines1 = func1.content
-    local lines2 = func2.content
+    local lines1 = getNormalizedContent(func1)
+    local lines2 = getNormalizedContent(func2)
     
     if #lines1 ~= #lines2 then
         return false
@@ -538,13 +536,8 @@ local function functionsAreSimilar(func1, func2)
     
     local differences = 0
     for i = 1, #lines1 do
-        local line1 = lines1[i]
-        local line2 = lines2[i]
-        
-        -- Normalize whitespace for comparison
-        local normalized1 = line1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-        local normalized2 = line2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-        
+        local normalized1 = lines1[i]
+        local normalized2 = lines2[i]
         if normalized1 ~= normalized2 then
             differences = differences + 1
         end
@@ -564,8 +557,8 @@ local function compareFunctions(func1, func2)
         return functionsAreIdentical(func1, func2), nil
     end
     
-    local lines1 = func1.content
-    local lines2 = func2.content
+    local lines1 = getNormalizedContent(func1)
+    local lines2 = getNormalizedContent(func2)
     
     -- If functions have different number of lines, they're different
     if #lines1 ~= #lines2 then
@@ -576,19 +569,14 @@ local function compareFunctions(func1, func2)
     local identical = true
     
     for i = 1, #lines1 do
-        local line1 = lines1[i]
-        local line2 = lines2[i]
-        
-        -- Normalize whitespace for comparison
-        local normalized1 = line1:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-        local normalized2 = line2:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-        
+        local normalized1 = lines1[i]
+        local normalized2 = lines2[i]
         if normalized1 ~= normalized2 then
             identical = false
             table.insert(differences, {
                 line = i,
-                file1 = line1,
-                file2 = line2
+                file1 = func1.content and func1.content[i] or "",
+                file2 = func2.content and func2.content[i] or ""
             })
         end
     end
@@ -603,21 +591,15 @@ local function mergeFunctionContent(func1, func2, differences)
     end
     
     local mergedContent = {}
-    local diffIndex = 1
-    
-    for i = 1, #func1.content do
-        local line1 = func1.content[i]
-        local line2 = func2.content[i]
-        
-        if diffIndex <= #differences and differences[diffIndex].line == i then
-            -- This line has differences, merge them
-            local diff = differences[diffIndex]
-            local mergedLine = mergeLineContent(diff.file1, diff.file2)
-            table.insert(mergedContent, mergedLine)
-            diffIndex = diffIndex + 1
+    local diffsByLine = {}
+    for _, d in ipairs(differences) do diffsByLine[d.line] = d end
+    local maxLines = math.max(#func1.content, #func2.content)
+    for i = 1, maxLines do
+        local diff = diffsByLine[i]
+        if diff then
+            mergedContent[#mergedContent + 1] = mergeLineContent(diff.file1, diff.file2)
         else
-            -- Lines are identical, use either one
-            table.insert(mergedContent, line1)
+            mergedContent[#mergedContent + 1] = func1.content[i] or func2.content[i] or ""
         end
     end
     
@@ -912,6 +894,9 @@ function M.mergeFiles(contents)
         end
         return contents[1]
     elseif #contents == 2 then
+        if contents[1] == contents[2] then
+            return contents[1]
+        end
         local analysis1 = conflictResolution_luaBreakdown.analyzeFile(contents[1])
         local analysis2 = conflictResolution_luaBreakdown.analyzeFile(contents[2])
         

@@ -28,6 +28,7 @@ local zipCacheSize = 0
 local MAX_ZIP_CACHE_SIZE = 16
 
 local conflictStartTime = 0
+local conflictStartClock = 0
 local globalFileIndex = {}
 local processedHashes = {}
 
@@ -1718,7 +1719,20 @@ local function mergeConflictingFiles(filePath, modsList)
         if #luaContents == 1 then
             mergedData = luaContents[1]
         else
-            mergedData = conflictResolution_luaMerger.mergeFiles(luaContents)
+            local seen = {}
+            local uniqueContents = {}
+            for _, c in ipairs(luaContents) do
+                local h = computeFileHash(c)
+                if not seen[h] then
+                    seen[h] = true
+                    table.insert(uniqueContents, c)
+                end
+            end
+            if #uniqueContents == 1 then
+                mergedData = uniqueContents[1]
+            else
+                mergedData = conflictResolution_luaMerger.mergeFiles(uniqueContents)
+            end
         end
     elseif isJsonFile and #allObjects > 0 then
         if isJsonLines then
@@ -1795,9 +1809,9 @@ local function finalizeConflictResolution(resolvedCount, skippedCount, totalConf
     end
     log('I', 'ConflictResolver', message)
 
-    local duration = os.time() - conflictStartTime
+    local duration = os.clock() - conflictStartClock
     local cacheStats = getCacheStats()
-    log('I', 'ConflictResolver', string.format('Conflict resolution took %d seconds (cache entries: %d)', 
+    log('I', 'ConflictResolver', string.format('Conflict resolution took %0.3f seconds (cache entries: %d)', 
         duration, cacheStats.totalCacheEntries))
     
     if resolvedCount > 0 or skippedCount > 0 then
@@ -1884,6 +1898,7 @@ end
 
 local function resolveConflicts(forceRun)
     conflictStartTime = os.time()
+    conflictStartClock = os.clock()
     local currentTime = os.time()
     if not forceRun and (currentTime - lastResolutionTime) < RESOLUTION_DEBOUNCE_TIME then
         return {
