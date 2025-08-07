@@ -7,7 +7,7 @@ local RESOLUTION_DEBOUNCE_TIME = 2.0
 local MANIFEST_DIR = "/mods/mod_manifests/"
 local JSON_DETECTION_SAMPLE_SIZE = 4096
 local RESOLUTION_INDEX_FILE = MERGE_OUTPUT_DIR .. "resolutions.json"
-local RESOLUTION_INDEX_VERSION = "0.1"
+local RESOLUTION_INDEX_VERSION = "0.2"
 
 local resolvedConflicts = {}
 local conflictCounts = {}

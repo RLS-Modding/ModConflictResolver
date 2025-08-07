@@ -135,6 +135,30 @@ local function mergeReturnStatements(returns1, returns2)
     return merged
 end
 
+local function mergeOtherStatements(stmts1, stmts2)
+    local merged = {}
+    local seen = {}
+    if stmts1 then
+        for _, s in ipairs(stmts1) do
+            local key = s.fullStatement or s.statement or (s.line .. ":" .. tostring(s))
+            if not seen[key] then
+                table.insert(merged, s)
+                seen[key] = true
+            end
+        end
+    end
+    if stmts2 then
+        for _, s in ipairs(stmts2) do
+            local key = s.fullStatement or s.statement or (s.line .. ":" .. tostring(s))
+            if not seen[key] then
+                table.insert(merged, s)
+                seen[key] = true
+            end
+        end
+    end
+    return merged
+end
+
 -- Merge two lines that are different
 local function mergeLineContent(line1, line2)
     -- Special case: if one line has * 1.75 and the other doesn't, prefer the one with * 1.75
@@ -242,6 +266,37 @@ local function mergeStructureInternals(internals1, internals2)
     elseif internals2.returnStatements then
         merged.returnStatements = internals2.returnStatements
     end
+
+    -- Merge other statements (function calls like table.insert)
+    if internals1.otherStatements or internals2.otherStatements then
+        merged.otherStatements = mergeOtherStatements(internals1.otherStatements or {}, internals2.otherStatements or {})
+    end
+
+    -- Merge do blocks
+    if internals1.doBlocks and internals2.doBlocks then
+        local combined = {}
+        for _, v in ipairs(internals1.doBlocks) do table.insert(combined, v) end
+        for _, v in ipairs(internals2.doBlocks) do table.insert(combined, v) end
+        merged.doBlocks = combined
+    elseif internals1.doBlocks then
+        merged.doBlocks = internals1.doBlocks
+    elseif internals2.doBlocks then
+        merged.doBlocks = internals2.doBlocks
+    end
+
+    -- Merge simple lists: break/goto/labels
+    local function mergeSimpleList(a, b)
+        if a and b then
+            local out = {}
+            for _, v in ipairs(a) do table.insert(out, v) end
+            for _, v in ipairs(b) do table.insert(out, v) end
+            return out
+        end
+        return a or b
+    end
+    merged.breakStatements = mergeSimpleList(internals1.breakStatements, internals2.breakStatements)
+    merged.gotoStatements = mergeSimpleList(internals1.gotoStatements, internals2.gotoStatements)
+    merged.labels = mergeSimpleList(internals1.labels, internals2.labels)
     
     return merged
 end
@@ -472,6 +527,37 @@ local function mergeStructureInternals(internals1, internals2)
     elseif internals2.returnStatements then
         merged.returnStatements = internals2.returnStatements
     end
+
+    -- Merge other statements (function calls like table.insert)
+    if internals1.otherStatements or internals2.otherStatements then
+        merged.otherStatements = mergeOtherStatements(internals1.otherStatements or {}, internals2.otherStatements or {})
+    end
+
+    -- Merge do blocks
+    if internals1.doBlocks and internals2.doBlocks then
+        local combined = {}
+        for _, v in ipairs(internals1.doBlocks) do table.insert(combined, v) end
+        for _, v in ipairs(internals2.doBlocks) do table.insert(combined, v) end
+        merged.doBlocks = combined
+    elseif internals1.doBlocks then
+        merged.doBlocks = internals1.doBlocks
+    elseif internals2.doBlocks then
+        merged.doBlocks = internals2.doBlocks
+    end
+
+    -- Merge simple lists: break/goto/labels
+    local function mergeSimpleList(a, b)
+        if a and b then
+            local out = {}
+            for _, v in ipairs(a) do table.insert(out, v) end
+            for _, v in ipairs(b) do table.insert(out, v) end
+            return out
+        end
+        return a or b
+    end
+    merged.breakStatements = mergeSimpleList(internals1.breakStatements, internals2.breakStatements)
+    merged.gotoStatements = mergeSimpleList(internals1.gotoStatements, internals2.gotoStatements)
+    merged.labels = mergeSimpleList(internals1.labels, internals2.labels)
     
     return merged
 end
@@ -825,6 +911,15 @@ local function mergeAnalyses(analysis1, analysis2)
     end
     
     -- Merge other structures (simplified for now)
+    -- Merge top-level assignments (e.g., exports like M.new = new)
+    do
+        local assignments1 = analysis1.structure.assignments or {}
+        local assignments2 = analysis2.structure.assignments or {}
+        if (#assignments1 > 0) or (#assignments2 > 0) then
+            merged.structure.assignments = mergeAssignments(assignments1, assignments2)
+        end
+    end
+
     if analysis1.structure.returnStatements then
         for _, ret in ipairs(analysis1.structure.returnStatements) do
             table.insert(merged.structure.returnStatements, ret)

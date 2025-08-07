@@ -42,6 +42,10 @@ local function trimWhitespace(str)
     return str:match("^%s*(.-)%s*$")
 end
 
+local function escapePattern(str)
+    return (str:gsub("(%W)", "%%%1"))
+end
+
 -- Find the end of a multiline construct (table, function call, etc.)
 local function findMultilineEnd(lines, startLine, openChar, closeChar)
     local depth = 0
@@ -595,6 +599,45 @@ local function analyzeStructureRecursive(lines, startLine, endLine, baseLineOffs
                 end
                 -- Continue to end of loop for increment
             
+            -- Check for bracket-indexed assignments like arr[i] = value (including multiline values)
+            elseif trimmed:match("^([%w_%.]+%b%[%].-)%s*=%s*(.+)$") then
+                local assignVar, assignValue = trimmed:match("^([%w_%.]+%b%[%].-)%s*=%s*(.+)$")
+                -- Treat as non-local assignment
+                local constructType, openChar = isMultilineStart(trimmed)
+                if constructType and openChar then
+                    local closeChar = openChar == "{" and "}" or openChar == "(" and ")" or openChar == "[" and "]" or openChar
+                    local endLine, endPos = findMultilineEnd(lines, i, openChar, closeChar)
+                    if endLine then
+                        local fullValue = {}
+                        for j = i, endLine do
+                            if j == i then
+                                local valuePart = lines[j]:match("^%s*.-=%s*(.*)$")
+                                if valuePart then table.insert(fullValue, valuePart) end
+                            else
+                                table.insert(fullValue, lines[j])
+                            end
+                        end
+                        if not result.assignments then result.assignments = {} end
+                        table.insert(result.assignments, {
+                            variable = assignVar,
+                            value = table.concat(fullValue, "\n"),
+                            line = relativeLine,
+                            multiline = true,
+                            startLine = relativeLine,
+                            endLine = endLine - baseLineOffset
+                        })
+                        i = endLine + 1
+                        jumped = true
+                    else
+                        if not result.assignments then result.assignments = {} end
+                        table.insert(result.assignments, { variable = assignVar, value = assignValue, line = relativeLine })
+                    end
+                else
+                    if not result.assignments then result.assignments = {} end
+                    table.insert(result.assignments, { variable = assignVar, value = assignValue, line = relativeLine })
+                end
+                -- Continue to end of loop for increment
+            
             -- Check for elseif statements
             elseif trimmed:match("^elseif%s") then
                 if not result.otherStatements then result.otherStatements = {} end
@@ -1052,7 +1095,7 @@ function M.analyzeFile(content)
     return analysis
 end
 
-local function writeStructureToLua(structure, indent)
+local function writeStructureToLua(structure, indent, exports, moduleVar)
     local lines = {}
     local indentStr = string.rep("    ", indent)
     
@@ -1230,7 +1273,7 @@ local function writeStructureToLua(structure, indent)
             
             -- Write function internals
             if func.internals then
-                local internalLines = writeStructureToLua(func.internals, indent + 1)
+                local internalLines = writeStructureToLua(func.internals, indent + 1, exports, moduleVar)
                 for _, line in ipairs(internalLines) do
                     table.insert(lines, line)
                 end
@@ -1240,6 +1283,10 @@ local function writeStructureToLua(structure, indent)
             table.insert(lines, "")  -- Empty line after function
             
         elseif item.type == "assignment" then
+            local isTopLevel = indent == 0
+            local mv = moduleVar or "M"
+            local isExport = isTopLevel and item.variable:match("^" .. escapePattern(mv) .. "%.[%w_]+$") ~= nil
+            local target = isExport and exports or lines
             if item.assign and item.assign.multiline then
                 -- Handle multiline assignments
                 local valueLines = {}
@@ -1256,14 +1303,14 @@ local function writeStructureToLua(structure, indent)
                 -- Reconstruct the assignment with the value
                 if #valueLines > 0 then
                     -- First line gets the assignment declaration
-                    table.insert(lines, indentStr .. item.variable .. " = " .. valueLines[1])
+                    table.insert(target, indentStr .. item.variable .. " = " .. valueLines[1])
                     -- Subsequent lines are added as-is (with proper indentation)
                     for i = 2, #valueLines do
-                        table.insert(lines, indentStr .. valueLines[i])
+                        table.insert(target, indentStr .. valueLines[i])
                     end
                 end
             else
-                table.insert(lines, indentStr .. item.variable .. " = " .. item.value)
+                table.insert(target, indentStr .. item.variable .. " = " .. item.value)
             end
             
         elseif item.type == "return" then
@@ -1284,7 +1331,7 @@ local function writeStructureToLua(structure, indent)
             
             -- Write do block internals
             if doBlock.internals then
-                local internalLines = writeStructureToLua(doBlock.internals, indent + 1)
+                local internalLines = writeStructureToLua(doBlock.internals, indent + 1, exports, moduleVar)
                 for _, line in ipairs(internalLines) do
                     table.insert(lines, line)
                 end
@@ -1318,7 +1365,7 @@ local function writeStructureToLua(structure, indent)
                     
                     -- Write branch internals (this includes the content)
                     if branch.internals then
-                        local internalLines = writeStructureToLua(branch.internals, indent + 1)
+                        local internalLines = writeStructureToLua(branch.internals, indent + 1, exports, moduleVar)
                         for _, line in ipairs(internalLines) do
                             table.insert(lines, line)
                         end
@@ -1332,7 +1379,7 @@ local function writeStructureToLua(structure, indent)
                 
                 -- Write structure internals
                 if struct.internals then
-                    local internalLines = writeStructureToLua(struct.internals, indent + 1)
+                    local internalLines = writeStructureToLua(struct.internals, indent + 1, exports, moduleVar)
                     for _, line in ipairs(internalLines) do
                         table.insert(lines, line)
                     end
@@ -1356,6 +1403,7 @@ end
 -- Write analysis structure to Lua file
 function M.writeLuaFile(analysis)
     local lines = {}
+    local exports = {}
     
     -- Write module declaration if detected
     if analysis.hasModulePattern then
@@ -1365,12 +1413,22 @@ function M.writeLuaFile(analysis)
     
     -- Write the main structure
     if analysis.structure then
-        local structureLines = writeStructureToLua(analysis.structure, 0)
+        local structureLines = writeStructureToLua(analysis.structure, 0, exports, analysis.moduleVariable or "M")
         for _, line in ipairs(structureLines) do
             -- Skip duplicate module return statements - they'll be handled at the end
             if not (line:match("^return " .. (analysis.moduleVariable or "M") .. "%s*$") and analysis.hasModulePattern) then
                 table.insert(lines, line)
             end
+        end
+    end
+
+    -- Append exports at the end (before return M if present)
+    if #exports > 0 then
+        if #lines > 0 and lines[#lines]:match("%S") then
+            table.insert(lines, "")
+        end
+        for _, exLine in ipairs(exports) do
+            table.insert(lines, exLine)
         end
     end
     
