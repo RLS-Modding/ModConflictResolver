@@ -1730,8 +1730,6 @@ local function mergeConflictingFiles(filePath, modsList)
             end
             if #uniqueContents == 1 then
                 mergedData = uniqueContents[1]
-            else
-                mergedData = conflictResolution_luaMerger.mergeFiles(uniqueContents)
             end
         end
     elseif isJsonFile and #allObjects > 0 then
