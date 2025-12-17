@@ -1960,6 +1960,11 @@ local function onModDeactivated(modData)
     resolveConflicts()
 end
 
+local function onVehicleSwitched()
+    core_input_bindings.getUsedBindingsFiles()
+end
+
+M.onVehicleSwitched = onVehicleSwitched
 M.resolveConflicts = resolveConflicts
 M.getConflictStatus = getConflictStatus
 M.clearResolvedConflicts = clearResolvedConflicts
