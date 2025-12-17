@@ -1959,7 +1959,10 @@ local function onModDeactivated(modData)
 end
 
 local function onVehicleSwitched()
-    core_input_bindings.getUsedBindingsFiles()
+    core_jobSystem.create(function(job)
+        job.sleep(1)
+        core_input_bindings.getUsedBindingsFiles()
+    end)
 end
 
 M.onVehicleSwitched = onVehicleSwitched
